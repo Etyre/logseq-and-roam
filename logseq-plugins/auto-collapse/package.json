@@ -1,0 +1,9 @@
+{
+  "name": "logseq-auto-collapse",
+  "version": "0.1.0",
+  "description": "#auto-collapse-children collapses a block's children, #auto-collapse collapses the block itself, when the page opens",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-auto-collapse", "title": "Auto-collapse", "icon": "" }
+}

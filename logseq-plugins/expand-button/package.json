@@ -1,0 +1,9 @@
+{
+  "name": "logseq-expand-button",
+  "version": "0.1.0",
+  "description": "Roam-style buttons {{renderer :rbutton, [[label]]}}: a labelled button that expands its block one level",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-expand-button", "title": "Expand button", "icon": "" }
+}

@@ -1,0 +1,18 @@
+# Logseq plugins for the Roam → Logseq migration
+
+Each folder is one unpacked Logseq plugin (Settings → Advanced → Developer mode;
+Plugins → "Load unpacked plugin" → the folder). Plugins are per app, not per graph.
+They may be merged into one plugin later.
+
+| Folder | Plugin | What it does |
+|---|---|---|
+| `block-ids/` | Block IDs | persists `id::` on every block (setting, default on) and on `#ankify` blocks + parents; bulk command; the `{{renderer :ankify-active}}` suspend switch that replaces the Roam "Block UID" render component |
+| `inline-checkbox/` | Roam-style checkboxes | `{{renderer :cb, todo\|done, id}}`: any number of clickable checkboxes anywhere in a block; `/checkbox` inserts one |
+| `random-page/` | Random page | toolbar dice, command palette, Alt+R: open a random non-journal page |
+| `auto-collapse/` | Auto-collapse | `#auto-collapse-children` collapses a block's children, `#auto-collapse` collapses the block itself, when the page opens |
+| `expand-button/` | Expand button | `{{renderer :rbutton, [[Label]]}}` (Roam `{{[[Label]]}}` buttons): a labelled button that expands its block one level |
+| `template-commands/` | Template commands | expands SmartBlock-style `<%…%>` tokens in freshly inserted templates; lifts a template's metadata block to page properties |
+| `page-tags/` | Page tags inheritance | keeps a hidden `page-tags::` property on top-level blocks equal to the page's `tags::`, so all blocks on a tagged page match tag queries |
+| `backwards-embed/` | Backwards embed | `/Backwards embed` (or Mod+Shift+E): pick a page, a new block is created there (top level, or under the first block matching one of the "Parent block names" setting, tried in order) and `{{embed ((uuid))}}` is inserted at the cursor; those embeds get a source breadcrumb (marker property `backembed::`). Option: embed the parent block with its whole subtree instead. Roam counterpart: `../roam/backwards-embed.js` |
+| `claude-in-logseq/` | Claude in Logseq | `/claude` (slash command) or a `[[claude in logseq]]` or `[[cl:]]` reference turns the block into `[[claude in logseq]]: <what you wrote>` with a `=>` child that fills with Claude's reply as it streams in, one block per bullet. Add a sibling of `=>` with your next message and press Enter to continue; replies are tinted. Settings: API key, trigger page, model (`claude-opus-5`), effort (`low`), web search, what Claude sees besides the conversation (the parent blocks above it by default; optionally also their sibling blocks, or the whole page), lock on finished turns (read-only, cursor still moves, Enter starts a new follow-up), cursor at the end of each reply. Shares `claude-chat/core.js` with the Roam version. |
+| `auto-anki/` | Auto-anki | Claude writes ankify-format Anki notes under a block tagged with a home tag (setting; default `auto-generate cards`, `LLM-generated cards`), reading the block's siblings as source material. With more than 6 notes they are filed under labelled heading blocks, 2 to 6 per heading, at most two levels (settings). Purple bordered section with ↻ button and a stale dot; notes you edit turn amber and are frozen for the LLM; bookkeeping in a hidden `#auto-anki-state` child; edits/deletions collected on `auto-anki/examples` and sent with every request; prompt editable on `auto-anki/prompt`. Off inside template definitions (`template::` ancestor) or with the `#[[auto-anki off]]` tag (dashed border). API key, home/off tags, model, effort, extra instructions and auto-update are plugin settings. Shares `auto-anki/core.js` with the Roam version. |

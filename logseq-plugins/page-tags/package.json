@@ -1,0 +1,9 @@
+{
+  "name": "logseq-page-tags-inherit",
+  "version": "0.1.0",
+  "description": "Keeps a hidden page-tags:: property on every top-level block equal to the page's tags::, so block queries and linked references treat all blocks on a tagged page as tagged (Roam-style inheritance)",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-page-tags-inherit", "title": "Page tags inheritance", "icon": "" }
+}

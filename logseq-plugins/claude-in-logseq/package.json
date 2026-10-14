@@ -1,0 +1,9 @@
+{
+  "name": "logseq-claude-in-logseq",
+  "version": "0.1.0",
+  "description": "Ask Claude from a block (/claude or [[claude in logseq]]); the reply streams in as nested blocks and the thread continues with Enter",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-claude-in-logseq", "title": "Claude in Logseq", "icon": "" }
+}

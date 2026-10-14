@@ -1,0 +1,12 @@
+{
+  "name": "logseq-roam-inline-checkbox",
+  "version": "0.1.0",
+  "description": "Roam-style inline checkboxes: {{renderer :cb, todo|done, id}} — several per block, anywhere in the block, click to toggle.",
+  "main": "index.html",
+  "license": "MIT",
+  "logseq": {
+    "id": "logseq-roam-inline-checkbox",
+    "title": "Roam-style checkboxes",
+    "icon": "./icon.svg"
+  }
+}

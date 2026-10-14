@@ -1,0 +1,9 @@
+{
+  "name": "logseq-auto-anki",
+  "version": "0.1.0",
+  "description": "LLM-written Anki notes under a tagged block, in ankify format; user-edited notes are frozen",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-auto-anki", "title": "Auto-anki", "icon": "" }
+}

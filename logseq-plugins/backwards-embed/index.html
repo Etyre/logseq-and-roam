@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Backwards embed</title>
+    <style>
+      html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 14px; }
+      body { display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; box-sizing: border-box; background: rgba(0,0,0,0.25); }
+      #box { background: #fff; color: #222; width: 50vw; min-width: 420px; max-width: 640px; border-radius: 8px; box-shadow: 0 8px 40px rgba(0,0,0,0.35); overflow: hidden; }
+      #q { width: 100%; box-sizing: border-box; padding: 12px 14px; border: none; border-bottom: 1px solid #e3e6ea; font-size: 16px; outline: none; background: transparent; color: inherit; }
+      #list { max-height: 50vh; overflow-y: auto; }
+      .row { padding: 8px 14px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .row.sel { background: #e7f1fb; }
+      .row.create { font-style: italic; color: #6b7785; }
+      #hint { padding: 6px 14px; font-size: 12px; color: #8a94a0; border-top: 1px solid #e3e6ea; }
+      body.dark #box { background: #2b2f33; color: #e8e8e8; box-shadow: 0 8px 40px rgba(0,0,0,0.6); }
+      body.dark #q, body.dark #hint { border-color: #40464d; }
+      body.dark .row.sel { background: #3b4552; }
+      body.dark .row.create { color: #a0a8b0; }
+    </style>
+  </head>
+  <body>
+    <div id="box">
+      <input id="q" placeholder="Backwards embed to page…" autocomplete="off" spellcheck="false" />
+      <div id="list"></div>
+      <div id="hint">↑↓ choose · Enter confirm · Esc cancel</div>
+    </div>
+    <script src="./lsplugin.user.min.js"></script>
+    <script src="./index.js"></script>
+  </body>
+</html>

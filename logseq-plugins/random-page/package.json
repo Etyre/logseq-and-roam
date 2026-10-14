@@ -1,0 +1,9 @@
+{
+  "name": "logseq-random-page",
+  "version": "0.1.0",
+  "description": "Open a random page: toolbar button, command palette entry, Alt+R",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-random-page", "title": "Random page", "icon": "" }
+}

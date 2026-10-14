@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+*.egg-info/
+# Roam graph exports (personal data, 100MB+)
+switching-from-roam-to-logseq/eli-*.json
+switching-from-roam-to-logseq/exports/eli-*.json
+# separate repo with its own history (github.com/Etyre/otter-import)
+otter-import/roam-extension/

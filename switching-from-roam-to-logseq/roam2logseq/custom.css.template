@@ -1,0 +1,26 @@
+/* Written by roam2logseq.convert (2026-09-05). Edit freely; the converter only writes
+   this file when the graph folder has none. */
+
+/* Part IX: collapsible page-property table. Collapsed, the page's property block is a
+   single line reading "Properties"; hover over it, or click into it, to unfold. */
+.pre-block .block-properties {
+  position: relative;
+  min-height: 1.6em;
+  padding-top: 1.7em;
+}
+.pre-block .block-properties::before {
+  content: "Properties";
+  position: absolute; left: 0.6em; top: 0.25em;
+  opacity: 0.55; font-size: 0.85em; letter-spacing: 0.02em; text-transform: uppercase;
+}
+.pre-block .block-properties > * {
+  display: none;
+}
+.pre-block .block-properties:hover > *,
+.pre-block:focus-within .block-properties > * {
+  display: revert;
+}
+.pre-block .block-properties:hover::before,
+.pre-block:focus-within .block-properties::before {
+  opacity: 0.35;
+}

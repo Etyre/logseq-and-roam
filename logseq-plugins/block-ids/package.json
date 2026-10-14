@@ -1,0 +1,12 @@
+{
+  "name": "logseq-block-ids",
+  "version": "0.1.0",
+  "description": "Persists a permanent id:: on every block (and on #ankify blocks and their parents); renders the ankify Active/Suspended switch. Load-bearing for ankify_logseq, the multi-window setup, and the Roam round trip.",
+  "main": "index.html",
+  "license": "MIT",
+  "logseq": {
+    "id": "logseq-block-ids",
+    "title": "Block IDs",
+    "icon": "./icon.svg"
+  }
+}

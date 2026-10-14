@@ -1,0 +1,9 @@
+{
+  "name": "logseq-template-commands",
+  "version": "0.1.0",
+  "description": "Expands SmartBlock-style <%…%> commands in freshly inserted Logseq templates (cursor, parent text/link, page/block links, random number/block, repeat with input) and lifts a template's metadata block to page properties",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-template-commands", "title": "Template commands", "icon": "" }
+}

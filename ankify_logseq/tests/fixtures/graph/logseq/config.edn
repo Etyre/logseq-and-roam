@@ -1,0 +1,5 @@
+{:meta/version 1
+ ;; :journal/page-title-format "MMM do, yyyy"   <- commented out, must be ignored
+ :journal/page-title-format "MMMM do, yyyy"
+ :file/name-format :triple-lowbar
+ :preferred-format :markdown}

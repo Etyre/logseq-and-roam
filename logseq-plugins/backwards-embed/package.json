@@ -1,0 +1,9 @@
+{
+  "name": "logseq-backwards-embed",
+  "version": "0.1.0",
+  "description": "Backwards embed: pick a page, create a new block there, embed it here",
+  "main": "index.html",
+  "author": "Eli Tyre",
+  "license": "MIT",
+  "logseq": { "id": "logseq-backwards-embed", "title": "Backwards embed", "icon": "" }
+}

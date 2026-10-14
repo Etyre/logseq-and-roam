@@ -1,0 +1,933 @@
+// auto-anki for Roam — built from auto-anki/core.js + auto-anki/roam-adapter.js (2026-10-13). Edit those, then run auto-anki/build.sh.
+/**
+ * Auto-anki core: platform-independent logic shared by the Roam roam/js block and the
+ * Logseq plugin. Everything here works on plain trees {uid, text, children} supplied
+ * by an adapter; the adapter does all reading and writing of the graph.
+ *
+ * Concepts
+ *   home block     a block tagged #[[auto-generate cards]] or [[LLM-generated cards]]
+ *   content blocks the home block's siblings and all their descendants (LLM: read)
+ *   notes          blocks under the home block carrying the ankify tag, in ankify_roam /
+ *                  ankify_logseq format (LLM: write, except frozen notes)
+ *   groups         when there are more than a few notes they sit under labelled heading
+ *                  blocks (at most two levels deep); a heading is any block under the
+ *                  home block without the ankify tag that has notes below it
+ *   state block    a hidden last child of the home block, "#auto-anki-state {json}",
+ *                  holding the hash of what the LLM last wrote for every note, the set
+ *                  of frozen (user-edited) notes and the content hash of the last run
+ */
+(function (root) {
+  const DEFAULT_HOME_TAGS = ["auto-generate cards", "llm-generated cards"];
+  // adapters may replace this list from their settings (lowercase page names)
+  const DEFAULT_OFF_TAGS = ["auto-anki off"];
+  const settings = { homeTags: DEFAULT_HOME_TAGS.slice(), offTags: DEFAULT_OFF_TAGS.slice() };
+  const homeTagsLower = () => settings.homeTags.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
+  const STATE_TAG = "auto-anki-state";
+  const DEFAULT_ANKIFY_TAG = "ankify";
+
+  // ---------- text helpers ----------
+  const norm = (s) => String(s || "").replace(/\r/g, "").split("\n").filter((l) => !/^[\w-]+::\s/.test(l)).join("\n").replace(/[ \t]+/g, " ").trim();
+
+  function hash(str) {
+    // FNV-1a 32-bit twice with different seeds -> 16 hex chars
+    let h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x9747b28c;
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      h1 ^= c; h1 = Math.imul(h1, 0x01000193) >>> 0;
+      h2 ^= c; h2 = Math.imul(h2, 0x01000193) >>> 0; h2 ^= h2 >>> 13;
+    }
+    return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+  }
+
+  const lowerTags = (text) => {
+    const tags = [];
+    const re = /#\[\[([^\]]+)\]\]|\[\[([^\]]+)\]\]|#([^\s#\[\]]+)/g;
+    let m;
+    while ((m = re.exec(text || ""))) tags.push((m[1] || m[2] || m[3]).trim().toLowerCase());
+    return tags;
+  };
+  const isHome = (text) => { const h = homeTagsLower(); return lowerTags(text).some((t) => h.includes(t)); };
+  const isOff = (text) => { const o = (settings.offTags || []).map((t) => String(t).trim().toLowerCase()); return lowerTags(text).some((t) => o.includes(t)); };
+  /** A home block is active unless it carries an off tag or sits inside a template definition. */
+  async function isActive(adapter, home) {
+    if (!home || isOff(home.text)) return false;
+    if (adapter.isInTemplate) { try { if (await adapter.isInTemplate(home.uid)) return false; } catch (e) {} }
+    return true;
+  }
+  const isStateBlock = (text) => /^\s*#\[?\[?auto-anki-state\]?\]?\b/.test(text || "");
+
+  // ---------- state ----------
+  // notes[uid] = what the LLM last wrote: {hash, text, back, at}; kept after the note is frozen so
+  // the LLM's version and the user's edit can be recorded as an example.
+  // examples[noteUid] = {uid, userUid, hash}: the example block on the examples page for that note.
+  settings.examplesPage = "auto-anki/examples";
+  // groups[uid] = {text}: heading blocks the LLM created (removed again once empty).
+  function emptyState() { return { v: 4, contentHash: null, updatedAt: null, llmTags: [], notes: {}, frozen: [], examples: {}, groups: {} }; }
+
+  function parseState(text) {
+    if (!text) return emptyState();
+    const i = text.indexOf("{");
+    if (i < 0) return emptyState();
+    try {
+      const s = JSON.parse(text.slice(i));
+      const st = Object.assign(emptyState(), s, { notes: s.notes || {}, frozen: s.frozen || [], llmTags: s.llmTags || [], examples: s.examples || {}, groups: s.groups || {} });
+      delete st.deleted;
+      return st;
+    } catch (e) {
+      console.warn("[auto-anki] unreadable state block, starting fresh", e);
+      return emptyState();
+    }
+  }
+
+  const serializeState = (state) => `#${STATE_TAG} ${JSON.stringify(state)}`;
+
+  // ---------- notes ----------
+  const backTexts = (note) => (note.children || []).map((c) => norm(c.text)).filter(Boolean);
+  const fingerprint = (note) => hash(norm(note.text) + "\n" + backTexts(note).join("\n"));
+
+  const hasTag = (text, tag) => lowerTags(text).includes(String(tag || DEFAULT_ANKIFY_TAG).toLowerCase());
+  const hasNoteBelow = (b, tag) => (b.children || []).some((c) => hasTag(c.text, tag) || hasNoteBelow(c, tag));
+
+  /**
+   * Walk the home block's subtree: notes (blocks with the ankify tag, or tagless
+   * blocks with no notes below them), heading groups (tagless blocks with notes
+   * below) and the state block. Every note gets groupUid (null = directly under
+   * the home block); groups form a tree and are also indexed flat by uid.
+   */
+  function splitChildren(children, tag, homeUid) {
+    let stateBlock = null;
+    const notes = [], groups = [], groupIndex = new Map();
+    const walk = (kids, parentUid, list, depth) => {
+      for (const c of kids || []) {
+        if (isStateBlock(c.text)) { if (!stateBlock) stateBlock = c; continue; }
+        if (!hasTag(c.text, tag) && hasNoteBelow(c, tag)) {
+          const g = { uid: c.uid, text: c.text, parentUid, depth, notes: [], groups: [] };
+          list.push(g); groupIndex.set(c.uid, g);
+          walk(c.children, c.uid, g.groups, depth + 1);
+          continue;
+        }
+        if (norm(c.text) || (c.children || []).length) {
+          c.groupUid = parentUid === homeUid ? null : parentUid;
+          notes.push(c);
+          const g = c.groupUid && groupIndex.get(c.groupUid);
+          if (g) g.notes.push(c);
+        }
+      }
+    };
+    walk(children, homeUid || null, groups, 0);
+    return { notes, stateBlock, groups, groupIndex };
+  }
+
+  /**
+   * Bring the frozen set up to date: any note whose fingerprint differs from what the
+   * LLM last wrote, or that the LLM never wrote, was edited by the user and is frozen
+   * for good. Returns true if the state changed.
+   */
+  function reconcile(state, notes) {
+    let changed = false;
+    const frozen = new Set(state.frozen);
+    for (const n of notes) {
+      if (frozen.has(n.uid)) continue;
+      const rec = state.notes[n.uid];
+      if (!rec || rec.hash !== fingerprint(n)) { frozen.add(n.uid); changed = true; }
+    }
+    // LLM-written notes that no longer exist were deleted by the user
+    const vanished = [];
+    for (const uid of Object.keys(state.notes)) {
+      if (!notes.some((n) => n.uid === uid)) { vanished.push({ uid, rec: state.notes[uid] }); delete state.notes[uid]; changed = true; }
+    }
+    for (const uid of [...frozen]) {
+      if (!notes.some((n) => n.uid === uid)) { frozen.delete(uid); changed = true; }
+    }
+    state.frozen = [...frozen];
+    return { changed, vanished };
+  }
+
+  // ---------- examples page: the user's edits, own notes and deletions, graph-wide ----------
+  const day = () => new Date().toISOString().slice(0, 10);
+  const stripTag = (text, tag) => {
+    const t = (tag || DEFAULT_ANKIFY_TAG).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return String(text || "").replace(new RegExp(`\\s*#\\[\\[${t}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${t}(?![\\w-])`, "gi"), "").trim();
+  };
+
+  async function writeVersion(adapter, parentUid, label, text, back, ankifyTag) {
+    const uid = await adapter.createBlock(parentUid, `${label}: ${stripTag(text, ankifyTag)}`, { last: true });
+    for (const b of back || []) await adapter.createBlock(uid, b, { last: true });
+    return uid;
+  }
+
+  /**
+   * Record examples for newly frozen notes (edited or user-written), refresh the
+   * user's version when a frozen note is edited again, and record deletions.
+   * Mutates state.examples; returns true if anything was written.
+   */
+  async function recordExamples(adapter, home, notes, state, vanished, ankifyTag) {
+    const page = settings.examplesPage;
+    if (!page || !adapter.appendToPage) return false;
+    let wrote = false;
+    const frozen = new Set(state.frozen);
+    const where = home && home.pageTitle ? ` · page: ${home.pageTitle}` : "";
+    for (const n of notes) {
+      if (!frozen.has(n.uid)) continue;
+      const fp = fingerprint(n);
+      const rec = state.notes[n.uid];
+      const ex = state.examples[n.uid];
+      if (!ex) {
+        const label = rec && rec.text ? "EDITED" : "WRITTEN BY THE USER";
+        const uid = await adapter.appendToPage(page, `${label} · ${day()}${where}`);
+        if (rec && rec.text) await writeVersion(adapter, uid, "LLM wrote", rec.text, rec.back, ankifyTag);
+        const userUid = await writeVersion(adapter, uid, "User's version", n.text, backTexts(n), ankifyTag);
+        state.examples[n.uid] = { uid, userUid, hash: fp };
+        wrote = true;
+      } else if (ex.hash !== fp) {
+        await adapter.updateBlock(ex.userUid, `User's version: ${stripTag(n.text, ankifyTag)}`);
+        const cur = await adapter.getBlock(ex.userUid);
+        if (cur) await syncBack(adapter, cur, backTexts(n));
+        ex.hash = fp;
+        wrote = true;
+      }
+    }
+    for (const { uid, rec } of vanished || []) {
+      const ex = state.examples[uid];
+      if (ex) {
+        const cur = await adapter.getBlock(ex.uid);
+        if (cur && !/DELETED/.test(cur.text)) await adapter.updateBlock(ex.uid, cur.text.replace(/^(EDITED|WRITTEN BY THE USER)/, "$1, THEN DELETED"));
+        delete state.examples[uid];
+        wrote = true;
+      } else if (rec && rec.text) {
+        const exUid = await adapter.appendToPage(page, `DELETED BY THE USER · ${day()}${where}`);
+        await writeVersion(adapter, exUid, "LLM wrote", rec.text, rec.back, ankifyTag);
+        wrote = true;
+      }
+    }
+    // examples for notes that vanished without a record
+    for (const uid of Object.keys(state.examples)) if (!notes.some((n) => n.uid === uid)) delete state.examples[uid];
+    return wrote;
+  }
+
+  async function examplesText(adapter) {
+    const page = settings.examplesPage;
+    if (!page || !adapter.readPageTrees) return "";
+    try { return outline(await adapter.readPageTrees(page)).trim(); } catch (e) { return ""; }
+  }
+
+  // ---------- outline text for the prompt ----------
+  function outline(trees, depth = 0) {
+    let out = "";
+    for (const t of trees || []) {
+      const text = norm(t.text);
+      if (text) out += "  ".repeat(depth) + "- " + text.replace(/\n/g, "\n" + "  ".repeat(depth) + "  ") + "\n";
+      out += outline(t.children, depth + 1);
+    }
+    return out;
+  }
+  const contentHash = (trees) => hash(outline(trees));
+
+  // ---------- ankify formatting ----------
+  function ensureAnkifyTag(text, tag) {
+    const t = tag || DEFAULT_ANKIFY_TAG;
+    if (lowerTags(text).includes(t.toLowerCase())) return text;
+    return text.replace(/\s+$/, "") + (/\s/.test(t) ? ` #[[${t}]]` : ` #${t}`);
+  }
+
+  function normaliseCloze(text) {
+    // Anki's {{c1::x::hint}} -> ankify's {c1:x::hint}; never leave Anki syntax behind
+    return String(text || "").replace(/\{\{c(\d+)::(.*?)\}\}/gs, (m, n, body) => `{c${n}:${body}}`);
+  }
+
+  const tagToken = (t) => (/[\s#\[\]]/.test(t) ? `#[[${t}]]` : `#${t}`);
+
+  /** Rewrite the home block text: keep the user's words and the home tag, swap the LLM's tags. */
+  function homeTextWithTags(text, oldLlmTags, newTags) {
+    let t = text || "";
+    for (const tag of oldLlmTags || []) {
+      const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      t = t.replace(new RegExp(`\\s*#\\[\\[${esc}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${esc}(?![\\w-])`, "gi"), "");
+    }
+    const present = lowerTags(t);
+    const add = (newTags || []).filter((x) => x && !present.includes(x.toLowerCase())).map(tagToken);
+    return (t.replace(/\s+$/, "") + (add.length ? " " + add.join(" ") : "")).trim();
+  }
+
+  // ---------- prompt ----------
+  const SYSTEM = `You write and maintain Anki flashcards inside a user's outliner notes (Roam Research or Logseq). A sync tool (ankify) later turns each note block into an Anki note, so the FORMAT rules are strict. The user has made thousands of cards by hand; the SELECTION and STYLE rules below describe how they do it. Follow them closely.
+
+FORMAT
+- Each flashcard is one block ("text") with optional child blocks ("back").
+- Cloze notes: the deletion goes in single curly braces with a number, e.g. "The mitochondrion produces ATP through {c1:oxidative phosphorylation}". Hint after two colons: "{c1:ATP::three letters}". Deletions with the same number are revealed together; different numbers make separate cards. Never use Anki's double-brace syntax.
+- Basic notes: "text" is the prompt and "back" holds the answer as one or more short strings (each becomes a child block). A basic note must have a non-empty back.
+- Do not put the #ankify tag or any other tag in "text"; the tool adds it. Plain text only, apart from **bold**, __underline__ and [[Page]] links.
+
+WHAT TO CARD
+- The user's own distillation is the primary source. After reading, they distill what they learned into an organized tree (sections such as Distillation, Summary, Notes, compression, or simply their own paraphrases). Your main job is to break that tree into atomic facts and express each as a note. Raw quotes, transcripts and first-pass notes are secondary: take specific concrete facts from them too, but do not card their narrative.
+- Card: definitions of named terms; the one or two headline magnitudes of a topic; the causal mechanism ("why", "how") next to a fact; a source's central claim or key distinction; comparisons and contrasts; central actors with one salient attribute; surprising or counterintuitive facts; short how-tos (1 to 3 steps) and command-to-meaning pairs.
+- Do not card: the user's own reflections, evaluations, plans, todos or journal entries (they are context, never content); the author's argument or rhetoric; narrative colour and illustrative examples; incidental numbers, over-precise figures, secondary names, dates that are not anchors; lists of names without meaning; procedures or exercises (no task cards: every card has an answer).
+- Numbers: round to one or two significant figures and say "about" unless the exact value is the point.
+- Ephemeral facts (news, current versions, prices) only if the user distilled them, and then date-stamped: "As of 2024, ...".
+- Do not model what the user already knows; they remove those cards themselves.
+- If a fact is worth carding but the source looks wrong, inconsistent or unverifiable, still write the card and append " [check: <reason>]" to the end of its text.
+- Coverage: the distillation is already the user's selection of what matters, so express almost all of it: everything in it that can be meaningfully broken down into atomic facts and relationships should end up in cards. Do not filter it further for importance or interest. Be selective only with raw quotes, transcripts and first-pass notes, where you take just the specific concrete facts. There is no target number of cards.
+
+HOW TO WRITE
+- Concise above all: express each note in the minimum number of syllables that still contains every important part of the idea. Most prompts and most answers have fewer than 10 words. Cut articles, hedges, connectives, repeated context and words that only restate the question; answers are one short line, often a single word, number or phrase. A list becomes several back items, with a count cue in the prompt ("[two things]"). Examples (before -> after):
+  "What is the purpose of node's 'watch mode' in node?" -> "What does node's 'watch mode' do?"
+  "What is the objective of an 'upsert' operation? / The objective is to save data in the database, regardless if it already exists or not." -> "What does 'upsert' do? / Save data in the database, whether or not it already exists."
+  "What action does Fetch perform?" -> "What does Fetch do?"
+  "When was Hamas founded? / In 1987." -> "When was Hamas founded? / 1987"
+  "How can a copy of an object be made in JavaScript? / By spreading that object inside a new object." -> "JavaScript: how do you copy an object? / Spread it inside a new object."
+  "What do I do if I want to know the value of a given prop? / Look where the component is implemented / used." -> "How do I check the value of a prop? / Look where the component is used."
+- Open-ended prompts, never yes/no. "Was the public enthusiastic about WWII?" -> "What was the attitude of the American public towards WWII? / Determined to do what was needed, without enthusiasm or patriotic fervor." "Were wages frozen during WWII? / Yes." -> "What happened to wages during WWII? / Frozen."
+- Atomize: a complicated, multi-part fact usually becomes several separate cards. Each card must be complete and answerable on its own, with enough context in its prompt to stand alone; together the cards should cover all or most of the content of the distillation. Do not compress a compound idea into one card with a long answer.
+- Several cards per fact when they are different recall operations: "Paris is the capital of {c1:France}" and "{c1:Paris} is the capital of France" train different memories. Wherever a reversible card would help, write two cards, one in each direction (term and definition, date and event, both polarities of a relationship such as "when X rises, Y {c1:falls}" / "when X falls, Y {c1:rises}"). A cloze and a question version of the same fact are also fine when both help. Never write two cards that test the identical recall.
+- Unique answer, real recall. Choose what to ask (and what to delete in a cloze) so that exactly one answer is correct: not a blank that several different words would fill acceptably, and not a question with many defensible answers. At the same time the answer must not be guessable from the rest of the sentence or from the question's own wording; if the context gives it away, delete something else or add nothing that hints. Prefer deleting the specific term, name, number or outcome over deleting a generic word.
+- Cloze cards: one declarative sentence with the context first and the deleted payload at the END of the sentence, so the whole context is read before guessing. Delete a one- or two-word term, name or number. Use one number for a set that should be revealed together.
+- Basic prompts: "What is X?" / "Why did X happen?"; a bare "Term:" prompt whose back is the definition; or a sentence stem ending in "..." whose back begins with "...".
+- Open with a scope anchor when the fact is ambiguous out of context ("In 1900, ...", "JS:", "In RL, ...", "Kissinger claims ..."). Underline the word that distinguishes a card from its siblings ("How many people die of aging each __year__?").
+- Keep the user's wording where it is precise; otherwise rephrase into plain, compressed speech. Keep [[Page]] links that appear in the source. Attribute claims to their source when they are claims rather than facts.
+
+MAINTENANCE
+- Existing notes marked EDITABLE are yours: update them when the content changed, delete them when their fact is gone, keep them unchanged otherwise (return them with the same uid). Notes marked FROZEN were edited by the user: never return them, never duplicate their fact.
+- Return "uid" for a note you are updating and null for a new note. List uids to remove in "delete" (EDITABLE uids only).
+- When there are more than a few notes they are organised under labelled headings ("groups"); the exact size rules come with each request under RESPONSE STRUCTURE.
+- "tags": lowercase topic tags for the home block, as many as genuinely apply. Do not add deck or option tags; the user sets decks.
+- The EXAMPLES section (if present) lists, across the whole graph, notes the user edited (your version and theirs), notes they wrote themselves, and notes of yours they deleted. They are the strongest guide to what the user wants: imitate their edits in style, length, phrasing and level of detail, and do not write the kind of note they delete.`;
+
+  /** The built-in prompt as blocks: one block per line, "- " lines nested under the line before. */
+  function defaultPromptTrees() {
+    const out = [];
+    for (const para of SYSTEM.split(/\n\s*\n/)) {
+      let parent = null, bullet = null;
+      for (const line of para.split("\n")) {
+        if (!line.trim()) continue;
+        if (/^  \S/.test(line) && bullet) bullet.children.push({ text: line.trim(), children: [] }); // indented example line
+        else if (/^- /.test(line) && parent) { bullet = { text: line.replace(/^- /, ""), children: [] }; parent.children.push(bullet); }
+        else { parent = { text: line, children: [] }; bullet = null; out.push(parent); }
+      }
+    }
+    return out;
+  }
+
+  /** The prompt page's blocks back into text (inverse of defaultPromptTrees). */
+  function promptFromTrees(trees) {
+    const lines = [];
+    const walk = (t, depth) => {
+      const text = norm(t.text);
+      if (text) lines.push(depth === 0 ? text : depth === 1 ? "- " + text : "  ".repeat(depth - 1) + text);
+      for (const c of t.children || []) walk(c, depth + 1);
+    };
+    for (const t of trees || []) { walk(t, 0); }
+    return lines.join("\n").trim();
+  }
+
+  const NOTE_SCHEMA = {
+    type: "object",
+    properties: {
+      uid: { type: ["string", "null"] },
+      text: { type: "string" },
+      back: { type: "array", items: { type: "string" } },
+    },
+    required: ["uid", "text", "back"],
+    additionalProperties: false,
+  };
+  const NOTES_SCHEMA = { type: "array", items: NOTE_SCHEMA };
+  const LEAF_GROUP_SCHEMA = {
+    type: "object",
+    properties: { uid: { type: ["string", "null"] }, title: { type: "string" }, notes: NOTES_SCHEMA },
+    required: ["uid", "title", "notes"],
+    additionalProperties: false,
+  };
+  const GROUP_SCHEMA = {
+    type: "object",
+    properties: { uid: { type: ["string", "null"] }, title: { type: "string" }, notes: NOTES_SCHEMA, groups: { type: "array", items: LEAF_GROUP_SCHEMA } },
+    required: ["uid", "title", "notes", "groups"],
+    additionalProperties: false,
+  };
+  const SCHEMA = {
+    type: "object",
+    properties: {
+      tags: { type: "array", items: { type: "string" } },
+      notes: NOTES_SCHEMA,
+      groups: { type: "array", items: GROUP_SCHEMA },
+      delete: { type: "array", items: { type: "string" } },
+    },
+    required: ["tags", "notes", "groups", "delete"],
+    additionalProperties: false,
+  };
+
+  const DEFAULT_GROUPING = { threshold: 6, min: 2, max: 6 };
+  const groupingOf = (g) => Object.assign({}, DEFAULT_GROUPING, g || {});
+
+  function groupingRules(grouping) {
+    const g = groupingOf(grouping);
+    return `RESPONSE STRUCTURE
+- Count every note that will exist after your changes (yours plus FROZEN ones). If that is at most ${g.threshold}, return them all in the top-level "notes" and leave "groups" empty.
+- If it is more than ${g.threshold}, every note goes into a group under a short labelled heading ("title": a noun phrase such as "Mechanisms", "Key figures" or "Definitions"). Each leaf group holds ${g.min} to ${g.max} notes. A group may instead hold subgroups (one level only, so headings never nest more than two deep); a group holds either notes or subgroups, not both. Group by topic, in a sensible reading order.
+- Existing headings are listed as [GROUP] with a uid: return the uid to keep a heading (retitle it if a better title fits), null for a new one. Headings left with no notes are removed automatically.
+- Any note, EDITABLE or FROZEN, is filed under a group simply by listing it there; return FROZEN notes with their uid and their current text (any text you give for them is ignored). A FROZEN note you do not list stays where it is.`;
+  }
+
+  function buildUserMessage({ pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions, grouping }) {
+    const frozen = new Set(state.frozen);
+    let msg = "";
+    if (pageTitle) msg += `PAGE: ${pageTitle}\n\n`;
+    msg += "CONTENT BLOCKS (read-only source material):\n" + (outline(contentTrees) || "(empty)\n") + "\n";
+    msg += "EXISTING NOTES:\n";
+    if (!notes.length) msg += "(none)\n";
+    const pad = (d) => "  ".repeat(d);
+    const noteLines = (n, d) => {
+      const status = frozen.has(n.uid) ? "FROZEN" : "EDITABLE";
+      let out = `${pad(d)}- [${status}] uid=${n.uid}\n${pad(d)}  text: ${norm(n.text).replace(/\n/g, "\n" + pad(d) + "        ")}\n`;
+      for (const b of backTexts(n)) out += `${pad(d)}  back: ${b.replace(/\n/g, "\n" + pad(d) + "        ")}\n`;
+      return out;
+    };
+    const groupLines = (g, d) => {
+      let out = `${pad(d)}- [GROUP] uid=${g.uid} title: ${norm(g.text)}\n`;
+      for (const n of g.notes) out += noteLines(n, d + 1);
+      for (const sub of g.groups) out += groupLines(sub, d + 1);
+      return out;
+    };
+    for (const n of notes) if (!n.groupUid) msg += noteLines(n, 0);
+    for (const g of groups || []) msg += groupLines(g, 0);
+    msg += `\nCURRENT TOPIC TAGS ON THE HOME BLOCK: ${(homeTags || []).join(", ") || "(none)"}\n`;
+    msg += "\n" + groupingRules(grouping) + "\n";
+    if (extraInstructions) msg += `\nADDITIONAL INSTRUCTIONS FROM THE USER:\n${extraInstructions}\n`;
+    msg += "\nReturn the JSON object now.";
+    return msg;
+  }
+
+  // ---------- Claude API (raw HTTP: this runs inside a browser tab / plugin iframe with no bundler) ----------
+  async function callClaude({ apiKey, model, effort, system, user, fetchImpl }) {
+    const f = fetchImpl || root.fetch.bind(root);
+    const body = {
+      model: model || "claude-opus-5",
+      max_tokens: 16000,
+      system: (Array.isArray(system) ? system : [system]).filter(Boolean).map((t) => ({ type: "text", text: t, cache_control: { type: "ephemeral" } })),
+      messages: [{ role: "user", content: user }],
+      output_config: { effort: effort || "high", format: { type: "json_schema", schema: SCHEMA } },
+      fallbacks: "default",
+    };
+    const headers = {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "server-side-fallback-2026-07-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    };
+    let res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+    if (res.status === 400) {
+      // older models / accounts: retry without structured output and fallbacks
+      const err = await res.text();
+      console.warn("[auto-anki] 400, retrying without output format:", err.slice(0, 300));
+      delete body.output_config.format; delete body.fallbacks; delete headers["anthropic-beta"];
+      res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+    }
+    if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
+    const data = await res.json();
+    if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+    return { result: parseJson(text), usage: data.usage, model: data.model };
+  }
+
+  function parseJson(text) {
+    try { return JSON.parse(text); } catch (e) {}
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+    throw new Error("Claude did not return valid JSON");
+  }
+
+  /**
+   * Turn the model's answer into concrete operations, honouring frozen notes (their text
+   * and back are never changed and they are never deleted, but they can be moved).
+   * Returns { creates:[{text, back, group}], updates:[{uid, text, back, group}], deletes:[uid],
+   * moves:[{uid, group}], groups:[planned group tree], tags:[] }. "group" is a planned
+   * group object ({uid|null, title, parent, notes, groups}) or null for the home block;
+   * its uid is filled in when the heading is created.
+   */
+  function plan(result, notes, state, ankifyTag, groupIndex) {
+    const frozen = new Set(state.frozen);
+    const byUid = new Map(notes.map((n) => [n.uid, n]));
+    const known = groupIndex || new Map();
+    const ops = { creates: [], updates: [], deletes: [], moves: [], groups: [], tags: [] };
+    const seen = new Set(), seenGroups = new Set();
+    const handleNote = (raw, group) => {
+      const text = ensureAnkifyTag(normaliseCloze(raw.text || "").trim(), ankifyTag);
+      const back = (raw.back || []).map((b) => normaliseCloze(String(b)).trim()).filter(Boolean);
+      if (!norm(text)) return;
+      if (raw.uid && byUid.has(raw.uid) && frozen.has(raw.uid)) {
+        // frozen: the text is never touched, but the note may be filed under another heading
+        if (seen.has(raw.uid)) return;
+        seen.add(raw.uid);
+        const cur = byUid.get(raw.uid);
+        if ((cur.groupUid || null) !== (group ? group.uid : null) || (group && !group.uid)) ops.moves.push({ uid: raw.uid, group });
+        return;
+      }
+      if (raw.uid && byUid.has(raw.uid) && !seen.has(raw.uid)) {
+        seen.add(raw.uid);
+        const cur = byUid.get(raw.uid);
+        if (norm(cur.text) !== norm(text) || backTexts(cur).join("\n") !== back.map(norm).join("\n")) ops.updates.push({ uid: raw.uid, text, back, group });
+        const targetUid = group ? group.uid : null; // null uid = new heading -> always a move
+        if ((cur.groupUid || null) !== targetUid || (group && !group.uid)) ops.moves.push({ uid: raw.uid, group });
+      } else if (!raw.uid || !byUid.has(raw.uid)) {
+        ops.creates.push({ text, back, group });
+      }
+    };
+    const handleGroup = (raw, parent, depth) => {
+      const title = String(raw.title || "").trim();
+      if (!title) { for (const n of raw.notes || []) handleNote(n, parent); return null; }
+      let uid = raw.uid && known.has(raw.uid) && !seenGroups.has(raw.uid) ? raw.uid : null;
+      if (uid) seenGroups.add(uid);
+      const g = { uid, title, parent, notes: [], groups: [] };
+      for (const n of raw.notes || []) handleNote(n, g);
+      if (depth < 1) for (const sub of raw.groups || []) { const s = handleGroup(sub, g, depth + 1); if (s) g.groups.push(s); }
+      return g;
+    };
+    for (const raw of result.notes || []) handleNote(raw, null);
+    for (const raw of result.groups || []) { const g = handleGroup(raw, null, 0); if (g) ops.groups.push(g); }
+    for (const uid of result.delete || []) if (byUid.has(uid) && !frozen.has(uid) && !seen.has(uid)) ops.deletes.push(uid);
+    ops.tags = [...new Set((result.tags || []).map((t) => String(t).trim().toLowerCase().replace(/^#/, "")).filter(Boolean))];
+    return ops;
+  }
+
+  // ---------- orchestration (adapter = platform read/write, see roam-adapter.js / logseq plugin) ----------
+  const busy = new Set(); // home uids currently being written
+
+  /** Re-read a home block, update the frozen set, persist state if it changed. */
+  async function refresh(adapter, homeUid, { persist = true } = {}) {
+    const home = await adapter.getBlock(homeUid);
+    if (!home) return null;
+    if (!(await isActive(adapter, home))) return { home, off: true, notes: [], state: emptyState(), stale: false, frozen: new Set() };
+    const { notes, stateBlock } = splitChildren(home.children, settings.ankifyTag, homeUid);
+    const state = parseState(stateBlock && stateBlock.text);
+    const { changed, vanished } = reconcile(state, notes);
+    let wrote = false;
+    if (persist && !busy.has(homeUid)) {
+      try { wrote = await recordExamples(adapter, home, notes, state, vanished, settings.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
+      if (changed || wrote) await writeState(adapter, homeUid, stateBlock, state);
+    }
+    let stale = false;
+    try { stale = state.contentHash !== contentHash(await adapter.getSiblingTrees(homeUid)); } catch (e) {}
+    return { home, notes, stateBlock, state, stale, frozen: new Set(state.frozen) };
+  }
+
+  async function writeState(adapter, homeUid, stateBlock, state) {
+    const text = serializeState(state);
+    if (stateBlock) { if (stateBlock.text !== text) await adapter.updateBlock(stateBlock.uid, text); return stateBlock.uid; }
+    const uid = await adapter.createBlock(homeUid, text, { last: true });
+    try { await adapter.collapse(uid); } catch (e) {}
+    return uid;
+  }
+
+  /** The whole cycle: read, ask Claude, apply, record. Returns a summary. */
+  async function runUpdate(adapter, homeUid, cfg) {
+    if (busy.has(homeUid)) throw new Error("already updating this block");
+    if (!cfg.apiKey) throw new Error("no API key set");
+    const home = await adapter.getBlock(homeUid);
+    if (!home) throw new Error("home block not found");
+    if (!(await isActive(adapter, home))) throw new Error("this block is switched off (off tag or inside a template)");
+    const { notes, stateBlock, groups, groupIndex } = splitChildren(home.children, cfg.ankifyTag, homeUid);
+    const state = parseState(stateBlock && stateBlock.text);
+    const { vanished } = reconcile(state, notes);
+    try { await recordExamples(adapter, home, notes, state, vanished, cfg.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
+    const contentTrees = await adapter.getSiblingTrees(homeUid);
+    if (!outline(contentTrees).trim()) throw new Error("no content blocks next to the home block");
+    const hl = homeTagsLower();
+    const homeTags = lowerTags(home.text).filter((t) => !hl.includes(t));
+    const user = buildUserMessage({ pageTitle: home.pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions: cfg.extraInstructions, grouping: cfg.grouping });
+    let system = SYSTEM;
+    if (cfg.promptPage && adapter.readPageTrees) {
+      try { const custom = promptFromTrees(await adapter.readPageTrees(cfg.promptPage)); if (custom) system = custom; } catch (e) { console.warn("[auto-anki] prompt page unreadable, using the built-in prompt", e); }
+    }
+    const examples = await examplesText(adapter);
+    const systemBlocks = [system, examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
+    const { result, usage } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
+    const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
+
+    busy.add(homeUid);
+    try {
+      const byUid = new Map(notes.map((n) => [n.uid, n]));
+      // where a new block goes: under a heading, or under the home block just above the state block
+      const placement = (parentUid) => (parentUid === homeUid && stateBlock ? { before: stateBlock.uid } : { last: true });
+      // headings first, so every note has a parent to go to
+      const ensureGroup = async (g, parentUid) => {
+        if (g.uid) {
+          const cur = groupIndex.get(g.uid);
+          if (cur && norm(cur.text) !== norm(g.title)) await adapter.updateBlock(g.uid, g.title);
+        } else {
+          g.uid = await adapter.createBlock(parentUid, g.title, placement(parentUid));
+          state.groups[g.uid] = { text: g.title };
+        }
+        for (const sub of g.groups) await ensureGroup(sub, g.uid);
+      };
+      for (const g of ops.groups) await ensureGroup(g, homeUid);
+      const targetOf = (group) => (group ? group.uid : homeUid);
+      for (const u of ops.updates) {
+        const cur = byUid.get(u.uid);
+        if (norm(cur.text) !== norm(u.text)) await adapter.updateBlock(u.uid, u.text);
+        await syncBack(adapter, cur, u.back);
+        state.notes[u.uid] = { hash: fingerprint({ text: u.text, children: u.back.map((t) => ({ text: t })) }), text: u.text, back: u.back, at: Date.now() };
+      }
+      for (const m of ops.moves) {
+        const target = targetOf(m.group);
+        if ((byUid.get(m.uid).groupUid || homeUid) === target || !adapter.moveBlock) continue;
+        await adapter.moveBlock(m.uid, target, placement(target));
+      }
+      for (const c of ops.creates) {
+        const target = targetOf(c.group);
+        const uid = await adapter.createBlock(target, c.text, placement(target));
+        for (const b of c.back) await adapter.createBlock(uid, b, { last: true });
+        state.notes[uid] = { hash: fingerprint({ text: c.text, children: c.back.map((t) => ({ text: t })) }), text: c.text, back: c.back, at: Date.now() };
+      }
+      for (const uid of ops.deletes) { await adapter.deleteBlock(uid); delete state.notes[uid]; }
+      await pruneGroups(adapter, homeUid, state, cfg.ankifyTag);
+      if (ops.tags.length || (state.llmTags || []).length) {
+        const newText = homeTextWithTags(home.text, state.llmTags, ops.tags);
+        if (newText !== home.text) await adapter.updateBlock(homeUid, newText);
+        state.llmTags = ops.tags;
+      }
+      state.contentHash = contentHash(contentTrees);
+      state.updatedAt = Date.now();
+      await writeState(adapter, homeUid, stateBlock, state);
+    } finally {
+      busy.delete(homeUid);
+    }
+    return { created: ops.creates.length, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
+  }
+
+  /** Delete headings the LLM made that have nothing left below them; forget headings that are gone. */
+  async function pruneGroups(adapter, homeUid, state, ankifyTag) {
+    for (let pass = 0; pass < 3; pass++) {
+      const home = await adapter.getBlock(homeUid);
+      if (!home) return;
+      const present = new Map();
+      const walk = (kids) => { for (const c of kids || []) { present.set(c.uid, c); walk(c.children); } };
+      walk(home.children);
+      let removed = false;
+      for (const uid of Object.keys(state.groups || {})) {
+        const b = present.get(uid);
+        if (!b) { delete state.groups[uid]; continue; }
+        if (!hasTag(b.text, ankifyTag) && !hasNoteBelow(b, ankifyTag) && !(b.children || []).some((c) => norm(c.text))) {
+          await adapter.deleteBlock(uid); delete state.groups[uid]; removed = true;
+        }
+      }
+      if (!removed) return;
+    }
+  }
+
+  async function syncBack(adapter, note, back) {
+    const kids = (note.children || []);
+    for (let i = 0; i < Math.max(kids.length, back.length); i++) {
+      if (i < kids.length && i < back.length) { if (norm(kids[i].text) !== norm(back[i])) await adapter.updateBlock(kids[i].uid, back[i]); }
+      else if (i < back.length) await adapter.createBlock(note.uid, back[i], { last: true });
+      else await adapter.deleteBlock(kids[i].uid);
+    }
+  }
+
+  const isBusy = (uid) => busy.has(uid);
+
+  root.AutoAnkiCore = {
+    refresh, runUpdate, isBusy,
+    settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
+    norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
+    splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
+    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, plan, pruneGroups,
+    defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+
+/**
+ * Auto-anki for Roam Research (roam/js). Requires core.js above it in the same file
+ * (roam/auto-anki.js is built from both by auto-anki/build.sh).
+ *
+ * Tag a block with one of CONFIG.homeTags. Its siblings (and their descendants) are the
+ * source material; its children are the Anki notes the LLM writes (under labelled
+ * headings once there are more than a few, see CONFIG.grouping). Trigger an update
+ * with the small button on the block, the command palette ("Auto-anki: update cards")
+ * or the block context menu. Notes you edit turn a different colour and are never
+ * touched by the LLM again.
+ *
+ * First run "Auto-anki: set API key" from the command palette (stored in this browser's
+ * localStorage, never in the graph).
+ */
+(function () {
+  const CONFIG = {
+    homeTags: ["auto-generate cards", "LLM-generated cards"],
+    offTags: ["auto-anki off"], // add one of these to a home block to switch it off
+    templateTags: ["roam/templates", "SmartBlock"], // home blocks under one of these (a template definition) are off
+    ankifyTag: "ankify",
+    model: "claude-opus-5",
+    effort: "high", // low | medium | high | xhigh | max
+    extraInstructions: "", // free text appended to every request, e.g. deck or style preferences
+    // More than `threshold` notes -> the notes are organised under labelled heading blocks
+    // (at most two levels deep); every leaf heading holds between `min` and `max` notes.
+    grouping: { threshold: 6, min: 2, max: 6 },
+    autoUpdate: false, // regenerate on its own once the content has been quiet for quietMinutes
+    quietMinutes: 3,
+    showStateBlock: false, // show the hidden "#auto-anki-state" bookkeeping block
+    hotkey: "", // e.g. "ctrl-alt-k" for the update command
+    promptPage: "auto-anki/prompt", // page holding the instructions to the model; empty/missing = built-in
+    examplesPage: "auto-anki/examples", // page where your edits/deletions are collected as examples for the model
+  };
+
+  const api = window.roamAlphaAPI;
+  const core = window.AutoAnkiCore;
+  if (!api || !core) return;
+  if (window.__autoAnkiLoaded) return;
+  window.__autoAnkiLoaded = true;
+  core.settings.homeTags = CONFIG.homeTags;
+  core.settings.offTags = CONFIG.offTags;
+  core.settings.examplesPage = CONFIG.examplesPage;
+  core.settings.ankifyTag = CONFIG.ankifyTag;
+
+  const KEY_STORAGE = "auto-anki:apiKey";
+  const apiKey = () => localStorage.getItem(KEY_STORAGE) || "";
+  const toast = (msg, kind) => (window.iziToast ? iziToast[kind || "info"]({ message: msg, timeout: 6000 }) : console.log("[auto-anki]", msg));
+
+  // ---------- adapter: graph read/write through roamAlphaAPI ----------
+  const TREE = "[:block/uid :block/string :block/order {:block/children ...}]";
+  const sortKids = (b) => [...((b && b[":block/children"]) || [])].sort((x, y) => (x[":block/order"] || 0) - (y[":block/order"] || 0));
+  const toTree = (b) => ({ uid: b[":block/uid"], text: b[":block/string"] || "", children: sortKids(b).map(toTree) });
+
+  const adapter = {
+    async getBlock(uid) {
+      const b = api.pull(`[:block/uid :block/string :block/order {:block/children ${TREE}} {:block/page [:node/title]} {:block/_children [:block/uid]}]`, [":block/uid", uid]);
+      if (!b) return null;
+      const t = toTree(b);
+      t.pageTitle = b[":block/page"] && b[":block/page"][":node/title"];
+      const p = b[":block/_children"];
+      t.parentUid = p && p[0] && p[0][":block/uid"];
+      return t;
+    },
+    async getSiblingTrees(uid) {
+      const home = await this.getBlock(uid);
+      if (!home || !home.parentUid) return [];
+      const parent = api.pull(`[:block/uid {:block/children ${TREE}}]`, [":block/uid", home.parentUid]);
+      return sortKids(parent).map(toTree).filter((t) => t.uid !== uid && !core.isHome(t.text));
+    },
+    async createBlock(parentUid, text, where) {
+      const uid = api.util.generateUID();
+      let order = "last";
+      if (where && where.before) {
+        const b = api.pull("[:block/order]", [":block/uid", where.before]);
+        if (b && typeof b[":block/order"] === "number") order = b[":block/order"];
+      }
+      await api.data.block.create({ location: { "parent-uid": parentUid, order }, block: { string: text, uid } });
+      return uid;
+    },
+    async updateBlock(uid, text) { await api.data.block.update({ block: { uid, string: text } }); },
+    async deleteBlock(uid) { await api.data.block.delete({ block: { uid } }); },
+    async moveBlock(uid, parentUid, where) {
+      let order = "last";
+      if (where && where.before) {
+        const b = api.pull("[:block/order]", [":block/uid", where.before]);
+        if (b && typeof b[":block/order"] === "number") order = b[":block/order"];
+      }
+      await api.data.block.move({ location: { "parent-uid": parentUid, order }, block: { uid } });
+    },
+    async collapse(uid) { await api.data.block.update({ block: { uid, open: false } }); },
+    async readPageTrees(title) {
+      const p = api.pull(`[:block/uid {:block/children ${TREE}}]`, [":node/title", title]);
+      return p ? sortKids(p).map(toTree) : null;
+    },
+    async writePageTrees(title, trees) {
+      let p = api.pull("[:block/uid]", [":node/title", title]);
+      if (!p) { const uid = api.util.generateUID(); await api.data.page.create({ page: { title, uid } }); p = { ":block/uid": uid }; }
+      const put = async (parentUid, nodes) => { for (const n of nodes) { const uid = await this.createBlock(parentUid, n.text, { last: true }); await put(uid, n.children || []); } };
+      await put(p[":block/uid"], trees);
+    },
+    async openPage(title) { await api.ui.mainWindow.openPage({ page: { title } }); },
+    async isInTemplate(uid) {
+      const b = api.pull("[{:block/parents [:block/string]}]", [":block/uid", uid]);
+      const want = CONFIG.templateTags.map((t) => t.toLowerCase());
+      return ((b && b[":block/parents"]) || []).some((p) => core.lowerTags(p[":block/string"]).some((t) => want.includes(t)));
+    },
+    async appendToPage(title, text) {
+      let p = api.pull("[:block/uid]", [":node/title", title]);
+      if (!p) { const uid = api.util.generateUID(); await api.data.page.create({ page: { title, uid } }); p = { ":block/uid": uid }; }
+      return this.createBlock(p[":block/uid"], text, { last: true });
+    },
+  };
+
+  // ---------- styling ----------
+  const style = document.createElement("style");
+  style.textContent = `
+    .roam-block-container[data-auto-anki="home"] { border: 2px solid #8e7cc3; border-radius: 6px; background: rgba(142,124,195,0.07); margin: 6px 0 6px -4px; padding: 4px 4px 4px 4px; position: relative; }
+    .roam-block-container[data-auto-anki="home"] > .rm-block-main { padding-right: 150px; }
+    .roam-block-container[data-auto-anki="off"] { border: 1px dashed #b8b8b8; border-radius: 6px; margin: 6px 0 6px -4px; padding: 4px; }
+    .roam-block-container[data-auto-anki="frozen"] > .rm-block-main { border-left: 3px solid #e0a030; margin-left: -6px; padding-left: 3px; background: rgba(224,160,48,0.10); border-radius: 3px; }
+    .roam-block-container[data-auto-anki="frozen"] > .rm-block-children { border-left-color: #e0a030; }
+    .auto-anki-bar { position: absolute; top: 4px; right: 6px; display: flex; align-items: center; gap: 6px; z-index: 5; }
+    .auto-anki-bar .auto-anki-count { font-size: 11px; line-height: 16px; color: #5b4a99; white-space: nowrap; }
+    .auto-anki-bar .auto-anki-dot { width: 8px; height: 8px; border-radius: 50%; background: #b8b8b8; }
+    .auto-anki-bar .auto-anki-dot.stale { background: #e0a030; }
+    .auto-anki-bar .auto-anki-dot.busy { background: #8e7cc3; animation: auto-anki-pulse 1s infinite alternate; }
+    .auto-anki-bar button { font-size: 11px; line-height: 16px; padding: 0 6px; border: 1px solid #8e7cc3; border-radius: 3px; background: #fff; color: #5b4a99; cursor: pointer; }
+    .auto-anki-bar button:hover { background: #8e7cc3; color: #fff; }
+    @keyframes auto-anki-pulse { from { opacity: 0.4 } to { opacity: 1 } }
+    ${CONFIG.showStateBlock ? "" : `.roam-block-container[data-page-links*="${core.STATE_TAG}"] { display: none !important; }`}
+  `;
+  document.head.appendChild(style);
+
+  // ---------- DOM decoration ----------
+  const uidOf = (container) => {
+    const el = container.querySelector(':scope > .rm-block-main [id^="block-input-"]');
+    return el ? el.id.slice(-9) : null;
+  };
+  const homeContainers = () => [...document.querySelectorAll(".roam-block-container[data-page-links]")].filter((c) => {
+    const links = c.getAttribute("data-page-links") || "";
+    return core.settings.homeTags.some((t) => links.toLowerCase().includes(JSON.stringify(t.toLowerCase()).slice(1, -1)));
+  });
+
+  const statusCache = new Map(); // homeUid -> {stale, frozen:Set, count}
+
+  // "12 cards", or "12 cards · 3 edited" when some are frozen; blank until the first status read
+  const countLabel = (st) => (st && typeof st.count === "number" ? `${st.count} card${st.count === 1 ? "" : "s"}${st.frozen && st.frozen.size ? ` · ${st.frozen.size} edited` : ""}` : "");
+
+  function decorate() {
+    for (const c of homeContainers()) {
+      const uid = uidOf(c);
+      if (!uid) continue;
+      const st = statusCache.get(uid);
+      if (st && st.off) { c.setAttribute("data-auto-anki", "off"); c.querySelector(":scope > .auto-anki-bar")?.remove(); continue; }
+      c.setAttribute("data-auto-anki", "home");
+      let bar = c.querySelector(":scope > .auto-anki-bar");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.className = "auto-anki-bar";
+        bar.innerHTML = `<span class="auto-anki-count"></span><span class="auto-anki-dot"></span><button type="button" title="Update cards">↻</button>`;
+        bar.querySelector("button").addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); update(uid); });
+        c.appendChild(bar);
+      }
+      bar.querySelector(".auto-anki-count").textContent = countLabel(st);
+      const dot = bar.querySelector(".auto-anki-dot");
+      dot.className = "auto-anki-dot" + (core.isBusy(uid) ? " busy" : st && st.stale ? " stale" : "");
+      const frozen = (st && st.frozen) || new Set();
+      for (const child of c.querySelectorAll(":scope > .rm-block-children .roam-block-container")) {
+        const cu = uidOf(child);
+        if (cu && frozen.has(cu)) child.setAttribute("data-auto-anki", "frozen");
+        else if (child.getAttribute("data-auto-anki") === "frozen") child.removeAttribute("data-auto-anki");
+      }
+      if (!st) refreshStatus(uid);
+    }
+  }
+
+  let refreshing = new Set();
+  async function refreshStatus(uid) {
+    if (refreshing.has(uid) || core.isBusy(uid)) return;
+    refreshing.add(uid);
+    try {
+      const r = await core.refresh(adapter, uid);
+      if (r) {
+        statusCache.set(uid, { stale: r.stale, frozen: r.frozen, off: !!r.off, count: r.notes.length });
+        if (CONFIG.autoUpdate && r.stale && !r.off) scheduleAuto(uid);
+      }
+    } catch (e) { console.error("[auto-anki] refresh", e); }
+    finally { refreshing.delete(uid); decorate(); }
+  }
+
+  // ---------- live watching ----------
+  const watched = new Map(); // parentUid -> callback
+  const timers = new Map();
+  function watchParents() {
+    for (const c of homeContainers()) {
+      const uid = uidOf(c);
+      if (!uid) continue;
+      const b = api.pull("[{:block/_children [:block/uid]}]", [":block/uid", uid]);
+      const parentUid = b && b[":block/_children"] && b[":block/_children"][0] && b[":block/_children"][0][":block/uid"];
+      if (!parentUid || watched.has(parentUid)) continue;
+      const cb = () => {
+        clearTimeout(timers.get(uid));
+        timers.set(uid, setTimeout(() => { statusCache.delete(uid); refreshStatus(uid); }, 1500));
+      };
+      try {
+        api.data.addPullWatch(`[:block/string {:block/children ...}]`, `[:block/uid "${parentUid}"]`, cb);
+        watched.set(parentUid, cb);
+      } catch (e) { console.warn("[auto-anki] pull watch failed", e); }
+    }
+  }
+
+  const autoTimers = new Map();
+  function scheduleAuto(uid) {
+    clearTimeout(autoTimers.get(uid));
+    autoTimers.set(uid, setTimeout(() => {
+      const st = statusCache.get(uid);
+      if (st && st.stale && !core.isBusy(uid)) update(uid, true);
+    }, Math.max(0.5, CONFIG.quietMinutes) * 60000));
+  }
+
+  let domTimer = null;
+  new MutationObserver(() => { clearTimeout(domTimer); domTimer = setTimeout(() => { decorate(); watchParents(); }, 300); })
+    .observe(document.body, { childList: true, subtree: true });
+  setTimeout(() => { decorate(); watchParents(); }, 1000);
+
+  // ---------- update ----------
+  async function update(uid, quiet) {
+    if (!apiKey()) { toast("Auto-anki: set the API key first (command palette → Auto-anki: set API key)", "warning"); return; }
+    if (core.isBusy(uid)) return;
+    decorate();
+    try {
+      const r = await core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
+      statusCache.delete(uid);
+      if (!quiet) toast(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
+    } catch (e) {
+      console.error("[auto-anki]", e);
+      toast("Auto-anki failed: " + e.message, "error");
+    } finally {
+      refreshStatus(uid);
+    }
+  }
+
+  function homeFromUid(uid) {
+    // the block itself or its nearest ancestor with a home tag
+    let cur = uid, guard = 0;
+    while (cur && guard++ < 50) {
+      const b = api.pull("[:block/uid :block/string {:block/_children [:block/uid]}]", [":block/uid", cur]);
+      if (!b) return null;
+      if (core.isHome(b[":block/string"])) return cur;
+      const p = b[":block/_children"];
+      cur = p && p[0] && p[0][":block/uid"];
+    }
+    return null;
+  }
+
+  function runCommand(ctx) {
+    let uid = null;
+    if (ctx && ctx["block-uid"]) uid = homeFromUid(ctx["block-uid"]);
+    if (!uid) { const f = api.ui.getFocusedBlock && api.ui.getFocusedBlock(); if (f && f["block-uid"]) uid = homeFromUid(f["block-uid"]); }
+    if (!uid) { const hs = homeContainers().map(uidOf).filter(Boolean); if (hs.length === 1) uid = hs[0]; }
+    if (!uid) { toast("Auto-anki: put the cursor in a tagged block (or its cards) first", "warning"); return; }
+    update(uid);
+  }
+
+  function askKey() {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center;";
+    overlay.innerHTML = `<div style="background:#fff;padding:16px;border-radius:6px;min-width:420px;box-shadow:0 8px 40px rgba(0,0,0,0.35);font-size:14px;">
+      <div style="margin-bottom:8px;">Anthropic API key (kept in this browser only)</div>
+      <input type="password" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;" placeholder="sk-ant-…" />
+      <div style="margin-top:10px;text-align:right;"><button class="c">Cancel</button> <button class="s" style="margin-left:6px;">Save</button></div></div>`;
+    const input = overlay.querySelector("input");
+    input.value = apiKey();
+    const close = () => overlay.remove();
+    overlay.querySelector(".c").onclick = close;
+    overlay.querySelector(".s").onclick = () => { const v = input.value.trim(); if (v) localStorage.setItem(KEY_STORAGE, v); else localStorage.removeItem(KEY_STORAGE); close(); toast("Auto-anki: key saved", "success"); };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") overlay.querySelector(".s").click(); if (e.key === "Escape") close(); e.stopPropagation(); });
+    document.body.appendChild(overlay);
+    setTimeout(() => input.focus(), 0);
+  }
+
+  const cmd = { label: "Auto-anki: update cards", callback: () => runCommand(null) };
+  if (CONFIG.hotkey) cmd["default-hotkey"] = CONFIG.hotkey;
+  api.ui.commandPalette.addCommand(cmd);
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: set API key", callback: askKey });
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: open examples", callback: () => adapter.openPage(CONFIG.examplesPage) });
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: edit prompt", callback: async () => {
+    try {
+      const existing = await adapter.readPageTrees(CONFIG.promptPage);
+      if (!existing || !core.promptFromTrees(existing)) await adapter.writePageTrees(CONFIG.promptPage, core.defaultPromptTrees());
+      await adapter.openPage(CONFIG.promptPage);
+    } catch (e) { console.error("[auto-anki]", e); toast("Auto-anki: could not open the prompt page: " + e.message, "error"); }
+  } });
+  if (api.ui.blockContextMenu) api.ui.blockContextMenu.addCommand({ label: "Auto-anki: update cards", callback: (ctx) => runCommand(ctx) });
+  window.autoAnki = { update, config: CONFIG, adapter, core };
+  console.log("[auto-anki] loaded");
+})();
