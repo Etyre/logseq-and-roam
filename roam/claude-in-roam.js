@@ -1,4 +1,4 @@
-// Claude in Roam — built from claude-chat/core.js + claude-chat/roam-adapter.js (2026-09-10). Edit those, then run claude-chat/build.sh.
+// Claude in Roam — built from claude-chat/core.js + claude-chat/roam-adapter.js (2026-10-26). Edit those, then run claude-chat/build.sh.
 /**
  * Claude-in-outliner core: platform-independent logic shared by the Roam roam/js block
  * ("Claude in Roam") and the Logseq plugin ("Claude in Logseq"). Works on plain trees
@@ -92,6 +92,8 @@
 
   // ---------- prompt ----------
   const system = (o) => `You are Claude, answering inside the user's ${settings.platform} notes. The user's notes around the request are given as CONTEXT, outermost first; the deepest items are the most relevant, and the REQUEST (if any) is what to answer. When there is no explicit request, respond to the deepest context items as if they were the message.
+
+The notes may carry Anki-related tags (ankify, auto-anki, deck names, cloze markup). Ignore them: they belong to a later, separate step. Do not mention flashcards, do not suggest what to ankify, and do not shape or frame your answer for cards unless the request itself asks for that.
 
 FORMAT (strict, the reply is written into outliner blocks):
 - Write a bullet outline. Every line is a bullet: "- " at the top level, sub-points indented by two spaces per level, at most three levels deep.
