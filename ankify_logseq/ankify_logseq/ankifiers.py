@@ -120,9 +120,16 @@ class LogseqGraphAnkifier:
         if not anki.is_model_cloze(self.note_cloze):
             raise ValueError(f"note_cloze must be a cloze note type and '{self.note_cloze}' isn't.")
 
+    # Bookkeeping blocks of other tools that may mention the ankify tag inside their own
+    # text (e.g. auto-anki's state block, whose JSON stores the text of every note it
+    # wrote) must never become notes themselves.
+    TAGS_NEVER_ANKIFY = ["auto-anki-state"]
+
     def is_block_to_ankify(self, block):
         tags_in_block = block.get_tags(inherit=False, from_attr=self.tags_from_attr)
         all_tags = block.get_tags(inherit=True, from_attr=self.tags_from_attr)
+        if any(t in tags_in_block for t in self.TAGS_NEVER_ANKIFY):
+            return False
         if self.tag_ankify in tags_in_block:
             if self.tag_dont_ankify and self.tag_dont_ankify in all_tags:
                 return False

@@ -91,6 +91,7 @@ assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), 
   assert.deepStrictEqual(g.n2.children.map((c) => g[c].text), ["lower pressure"]);
   const stateUid = g.H.children[g.H.children.length - 1];
   assert.ok(core.isStateBlock(g[stateUid].text), "state block is the last child");
+  assert.ok(!/ankify/.test(g[stateUid].text), "state block never contains the ankify tag (ankify_roam would ankify it)");
   let ref = await core.refresh(adapter, "H");
   assert.strictEqual(ref.stale, false); assert.deepStrictEqual(ref.state.frozen, []);
   // user edits n2's back and adds content

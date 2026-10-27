@@ -57,6 +57,8 @@
 
   // ---------- state ----------
   // notes[uid] = what the LLM last wrote: {hash, text, back, at}; kept after the note is frozen so
+  // (text is stored WITHOUT the ankify tag: ankify_roam/ankify_logseq scan every block's text for the
+  // tag, and a state block carrying "#ankify" inside its JSON would itself be turned into an Anki note)
   // the LLM's version and the user's edit can be recorded as an example.
   // examples[noteUid] = {uid, userUid, hash}: the example block on the examples page for that note.
   settings.examplesPage = "auto-anki/examples";
@@ -563,7 +565,7 @@ MAINTENANCE
         const cur = byUid.get(u.uid);
         if (norm(cur.text) !== norm(u.text)) await adapter.updateBlock(u.uid, u.text);
         await syncBack(adapter, cur, u.back);
-        state.notes[u.uid] = { hash: fingerprint({ text: u.text, children: u.back.map((t) => ({ text: t })) }), text: u.text, back: u.back, at: Date.now() };
+        state.notes[u.uid] = { hash: fingerprint({ text: u.text, children: u.back.map((t) => ({ text: t })) }), text: stripTag(u.text, cfg.ankifyTag), back: u.back, at: Date.now() };
       }
       for (const m of ops.moves) {
         const target = targetOf(m.group);
@@ -574,7 +576,7 @@ MAINTENANCE
         const target = targetOf(c.group);
         const uid = await adapter.createBlock(target, c.text, placement(target));
         for (const b of c.back) await adapter.createBlock(uid, b, { last: true });
-        state.notes[uid] = { hash: fingerprint({ text: c.text, children: c.back.map((t) => ({ text: t })) }), text: c.text, back: c.back, at: Date.now() };
+        state.notes[uid] = { hash: fingerprint({ text: c.text, children: c.back.map((t) => ({ text: t })) }), text: stripTag(c.text, cfg.ankifyTag), back: c.back, at: Date.now() };
       }
       for (const uid of ops.deletes) { await adapter.deleteBlock(uid); delete state.notes[uid]; }
       await pruneGroups(adapter, homeUid, state, cfg.ankifyTag);

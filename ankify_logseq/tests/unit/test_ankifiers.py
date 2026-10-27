@@ -32,6 +32,15 @@ class TestBlockAnkifier(unittest.TestCase):
         block = Block.from_string("a block #[[ankify: deck='1-Daily']]")
         self.assertEqual(ankifier._get_option(block, 'deck'), "1-Daily")
 
+    def test_state_block_is_not_ankified(self):
+        # auto-anki's hidden state block stores every note's text, "#ankify" included,
+        # inside its JSON; it must not be ankified itself
+        ankifier = LogseqGraphAnkifier()
+        state = Block.from_string('#auto-anki-state {"notes":{"x":{"text":"What is a dopamine neuron? #ankify"}}}')
+        self.assertFalse(ankifier.is_block_to_ankify(state))
+        note = Block.from_string("What is a dopamine neuron? #ankify")
+        self.assertTrue(ankifier.is_block_to_ankify(note))
+
     def test_front_to_html(self):
         """
         - [[Page title]]
