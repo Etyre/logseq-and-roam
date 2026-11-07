@@ -3,8 +3,35 @@ node_modules/
 __pycache__/
 *.pyc
 *.egg-info/
-# Roam graph exports (personal data, 100MB+)
+.venv/
+venv/
+dist/
+out/
+build/
+*.log
+# secrets and personal config (a committed *.example twin holds placeholders)
+.env
+config.env
+config.json
+*credentials*
+# state and caches
+*.state.json
+*.transit
+# large data and media (anything over ~5 MB stays out of git)
+*.zip
+*.gz
+*.anki2
+*.apkg
+*.csv
+*.xlsx
+*.mp3
+*.m4a
+*.wav
+*.mp4
+*.mov
+# Roam graph exports (personal data, 100MB+) and conversion output
 switching-from-roam-to-logseq/eli-*.json
 switching-from-roam-to-logseq/exports/eli-*.json
+*-convert-reports/
 # separate repo with its own history (github.com/Etyre/otter-import)
 otter-import/roam-extension/

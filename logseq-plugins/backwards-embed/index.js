@@ -279,11 +279,20 @@ function closePicker(restore) {
   logseq.hideMainUI({ restoreEditingCursor: !!restore });
 }
 
+// Drafts are never lost: the query is saved as you type and comes back (selected, so typing
+// replaces it) the next time the picker opens; it is cleared only when a page is chosen.
+const DRAFT_KEY = "backwards-embed:query";
+const draft = {
+  get: () => { try { return localStorage.getItem(DRAFT_KEY) || ""; } catch (e) { return ""; } },
+  set: (v) => { try { if (v) localStorage.setItem(DRAFT_KEY, v); else localStorage.removeItem(DRAFT_KEY); } catch (e) {} },
+};
+
 function choose(i) {
   const st = pickerState;
   const it = st?.items[i];
   if (it === undefined) return;
   const target = st.target;
+  draft.set(""); // submitted: the draft has done its job
   closePicker(false);
   const name = typeof it === "string" ? it : it.create;
   doBackwardsEmbed(target, name).catch((e) => {
@@ -314,15 +323,15 @@ async function openPicker() {
   const cfgs = await logseq.App.getUserConfigs();
   document.body.classList.toggle("dark", cfgs?.preferredThemeMode === "dark");
   const input = document.getElementById("q");
-  input.value = "";
+  input.value = draft.get();
   renderList();
   logseq.showMainUI({ autoFocus: true });
-  setTimeout(() => input.focus(), 50);
+  setTimeout(() => { input.focus(); input.select(); }, 50);
 }
 
 function wireUI() {
   const input = document.getElementById("q");
-  input.addEventListener("input", () => { if (pickerState) { pickerState.selected = 0; renderList(); } });
+  input.addEventListener("input", () => { draft.set(input.value); if (pickerState) { pickerState.selected = 0; renderList(); } });
   input.addEventListener("keydown", (e) => {
     const st = pickerState;
     if (!st) return;

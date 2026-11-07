@@ -14,12 +14,22 @@
  *   state block    a hidden last child of the home block, "#auto-anki-state {json}",
  *                  holding the hash of what the LLM last wrote for every note, the set
  *                  of frozen (user-edited) notes and the content hash of the last run
+ *
+ * Config: Roam keeps the API key in this browser's localStorage ("auto-anki:apiKey") and the
+ * rest in the CONFIG object of roam-adapter.js; Logseq keeps everything in the plugin settings
+ * (~/.logseq/settings/logseq-auto-anki.json). The prompt and the examples live in the graph
+ * (pages auto-anki/prompt and auto-anki/examples). Logs: the browser / Logseq developer console,
+ * prefixed "[auto-anki]". Every system prompt starts with the shared preamble and every call
+ * carries the contact_eli tool (llm-contact.js, loaded before this file); when Claude uses
+ * either, the run stops without touching the cards and the message is written to the graph
+ * page "llm-inbox" and kept in localStorage ("llm-inbox:records").
  */
 (function (root) {
+  const contact = () => { if (!root.LlmContact) throw new Error("llm-contact.js is not loaded (rebuild: auto-anki/build.sh)"); return root.LlmContact; };
   const DEFAULT_HOME_TAGS = ["auto-generate cards", "llm-generated cards"];
   // adapters may replace this list from their settings (lowercase page names)
   const DEFAULT_OFF_TAGS = ["auto-anki off"];
-  const settings = { homeTags: DEFAULT_HOME_TAGS.slice(), offTags: DEFAULT_OFF_TAGS.slice() };
+  const settings = { homeTags: DEFAULT_HOME_TAGS.slice(), offTags: DEFAULT_OFF_TAGS.slice(), app: "auto-anki" }; // app: name recorded in the LLM inbox
   const homeTagsLower = () => settings.homeTags.map((t) => String(t).trim().toLowerCase()).filter(Boolean);
   const STATE_TAG = "auto-anki-state";
   const DEFAULT_ANKIFY_TAG = "ankify";
@@ -404,6 +414,7 @@ MAINTENANCE
       max_tokens: 16000,
       system: (Array.isArray(system) ? system : [system]).filter(Boolean).map((t) => ({ type: "text", text: t, cache_control: { type: "ephemeral" } })),
       messages: [{ role: "user", content: user }],
+      tools: [contact().CONTACT_TOOL], // the preamble promises Claude a way to reach Eli
       output_config: { effort: effort || "high", format: { type: "json_schema", schema: SCHEMA } },
       fallbacks: "default",
     };
@@ -425,8 +436,24 @@ MAINTENANCE
     if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
     const data = await res.json();
     if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
+    const request = { model: body.model, system: body.system.map((b) => b.text), messages: body.messages, tools: body.tools };
+    // Claude asked for Eli (contact_eli call or an "@ELI:" line): no result, the caller stops
+    const rec = contact().check({ app: settings.app || "auto-anki", model: body.model, system: request.system, messages: request.messages, response: data, tools: request.tools });
+    if (rec) return { contact: rec, usage: data.usage, model: data.model, request };
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-    return { result: parseJson(text), usage: data.usage, model: data.model };
+    return { result: parseJson(text), usage: data.usage, model: data.model, request };
+  }
+
+  /** Record a contact in the graph (page "llm-inbox") and tell the user; the run stops after this. */
+  async function recordContact(adapter, rec) {
+    const C = contact();
+    const page = settings.inboxPage || C.INBOX_PAGE;
+    const blocks = C.pageBlocks(rec);
+    try {
+      if (adapter.appendToPage) { const uid = await adapter.appendToPage(page, blocks.text); for (const c of blocks.children) await adapter.createBlock(uid, c, { last: true }); }
+    } catch (e) { console.error("[auto-anki] could not write to the inbox page", e); }
+    if (adapter.notify) { try { adapter.notify(`Claude asked to reach Eli instead of writing cards: ${rec.message.slice(0, 200)} (recorded on ${page})`, "warning"); } catch (e) {} }
+    console.warn("[auto-anki] contact recorded", rec.id, rec.message);
   }
 
   function parseJson(text) {
@@ -539,8 +566,10 @@ MAINTENANCE
       try { const custom = promptFromTrees(await adapter.readPageTrees(cfg.promptPage)); if (custom) system = custom; } catch (e) { console.warn("[auto-anki] prompt page unreadable, using the built-in prompt", e); }
     }
     const examples = await examplesText(adapter);
-    const systemBlocks = [system, examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
-    const { result, usage } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
+    // the shared preamble always comes first, then the project's own (possibly user-edited) prompt
+    const systemBlocks = [contact().systemPrompt(system), examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
+    const { result, usage, contact: rec } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
+    if (rec) { await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
     const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
 
     busy.add(homeUid);
@@ -630,7 +659,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, plan, pruneGroups,
+    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, recordContact, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);

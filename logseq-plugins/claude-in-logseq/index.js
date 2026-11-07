@@ -5,6 +5,10 @@
  * it, and the block becomes "[[claude in logseq]]: <what you wrote>" with a "=>" child that fills
  * with Claude's reply as it streams in. To continue, add a sibling of "=>" with your next
  * message and press Enter: the reply appears as its children.
+ *
+ * Config: the plugin settings (Logseq → Plugins → Claude in Logseq → settings; stored in
+ * ~/.logseq/settings/logseq-claude-in-logseq.json), including the API key. Logs: the Logseq
+ * developer console, prefixed "[claude-in-logseq]". LLM inbox: see core.js / llm-contact.js.
  */
 
 const SETTINGS = [
@@ -79,6 +83,16 @@ const adapter = {
     const props = cur ? splitProps(cur.content).props : [];
     await logseq.Editor.updateBlock(uid, props.length ? text + "\n" + props.join("\n") : text);
   },
+  // the LLM inbox page: where a contact_eli call or an "@ELI:" line is recorded
+  async appendToPage(title, text) {
+    let page = await logseq.Editor.getPage(title);
+    if (!page) page = await logseq.Editor.createPage(title, {}, { redirect: false, createFirstBlock: false, journal: false });
+    if (!page) throw new Error("could not create page " + title);
+    const b = await logseq.Editor.appendBlockInPage(page.uuid, text, { focus: false });
+    if (!b) throw new Error("block creation failed");
+    return b.uuid;
+  },
+  notify(msg, kind) { logseq.UI.showMsg(msg, kind || "info", { timeout: 10000 }); },
   async focusBlock(uid, atEnd) {
     const cur = await logseq.Editor.getCurrentBlock();
     if (cur && cur.uuid !== uid && (await logseq.Editor.checkEditing()) && !(editing && editing.locked)) return; // the user is typing somewhere else
@@ -220,7 +234,7 @@ async function askHere(ctx) {
 
 function main() {
   logseq.useSettingsSchema(SETTINGS);
-  const applySettings = () => { const c = S(); Object.assign(core.settings, opts(), { platform: "Logseq", markup: "**bold**, *italics*, `code` and [[Page]] links (only to pages the notes already mention)" }); };
+  const applySettings = () => { const c = S(); Object.assign(core.settings, opts(), { platform: "Logseq", app: "claude-in-logseq", markup: "**bold**, *italics*, `code` and [[Page]] links (only to pages the notes already mention)" }); };
   applySettings();
   logseq.onSettingsChanged(applySettings);
 
@@ -238,6 +252,11 @@ function main() {
   logseq.Editor.registerSlashCommand("claude", onSlash);
   logseq.App.registerCommandPalette({ key: "claude-in-logseq-ask", label: "Claude in Logseq: ask here" }, () => askHere(null));
   logseq.Editor.registerBlockContextMenuItem("Claude in Logseq: ask here", (ctx) => askHere(ctx));
+  // records kept in this plugin's storage when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  logseq.App.registerCommandPalette({ key: "claude-in-logseq-copy-inbox", label: "Claude in Logseq: copy LLM inbox records" }, async () => {
+    const r = await globalThis.LlmContact.copyRecords();
+    logseq.UI.showMsg(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this plugin", "info");
+  });
 
   // [[cl:]] typed into a block (saved by Logseq as you type); a block that already has
   // children is an existing conversation, not a trigger

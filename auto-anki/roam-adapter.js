@@ -109,6 +109,7 @@
       if (!p) { const uid = api.util.generateUID(); await api.data.page.create({ page: { title, uid } }); p = { ":block/uid": uid }; }
       return this.createBlock(p[":block/uid"], text, { last: true });
     },
+    notify(msg, kind) { toast(msg, kind); },
   };
 
   // ---------- styling ----------
@@ -231,6 +232,7 @@
     try {
       const r = await core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
       statusCache.delete(uid);
+      if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
       if (!quiet) toast(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
     } catch (e) {
       console.error("[auto-anki]", e);
@@ -284,6 +286,11 @@
   api.ui.commandPalette.addCommand(cmd);
   api.ui.commandPalette.addCommand({ label: "Auto-anki: set API key", callback: askKey });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: open examples", callback: () => adapter.openPage(CONFIG.examplesPage) });
+  // records kept in this browser when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: copy LLM inbox records", callback: async () => {
+    const r = await window.LlmContact.copyRecords();
+    toast(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this browser", "info");
+  } });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: edit prompt", callback: async () => {
     try {
       const existing = await adapter.readPageTrees(CONFIG.promptPage);

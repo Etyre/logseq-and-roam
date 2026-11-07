@@ -1,7 +1,17 @@
 // node auto-anki/test_core.js — exercises the shared core with a fake adapter and a fake Claude.
 const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
+require("../llm-contact/llm-contact.js");
 require("./core.js");
 const core = globalThis.AutoAnkiCore;
+const LlmContact = globalThis.LlmContact;
+
+// ----- LLM inbox: the generated preamble and tool match the shared files word for word -----
+const SHARED = path.join(process.env.HOME, "Documents/agent-coding/shared");
+assert.strictEqual(LlmContact.PREAMBLE, fs.readFileSync(path.join(SHARED, "llm-system-prompt-preamble.md"), "utf8").trim(), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.CONTACT_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "contact_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.ok(LlmContact.systemPrompt("rules").startsWith(LlmContact.PREAMBLE + "\n\nrules"));
 
 // ----- state / reconcile -----
 const st = core.parseState('#auto-anki-state {"v":1,"notes":{"a":{"hash":"x"}},"frozen":[]}');
@@ -73,7 +83,8 @@ assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), 
     calls++;
     const body = JSON.parse(opts.body);
     assert.ok(body.output_config.format.type === "json_schema");
-    assert.strictEqual(body.system[0].text, promptPage ? "custom prompt" : core.SYSTEM, "prompt page overrides the built-in prompt");
+    assert.strictEqual(body.system[0].text, LlmContact.systemPrompt(promptPage ? "custom prompt" : core.SYSTEM), "shared preamble first, then the (prompt page or built-in) prompt");
+    assert.deepStrictEqual(body.tools, [LlmContact.CONTACT_TOOL], "contact_eli offered on every call");
     if (calls === 1) promptPage = [{ text: "custom prompt", children: [] }];
     assert.ok(opts.headers["anthropic-dangerous-direct-browser-access"] === "true");
     const a = answers.shift();
@@ -156,9 +167,52 @@ assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), 
   adapter.isInTemplate = async () => false;
   ref = await core.refresh(adapter, "H");
   assert.ok(!ref.off);
+  await contactTests();
   await groupingTests();
   console.log("core tests OK");
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// ----- LLM inbox: Claude asks for Eli -> nothing is written, the message lands on the inbox page -----
+async function contactTests() {
+  const { g, adapter } = fakeGraph();
+  const pages = {};
+  adapter.appendToPage = async (title, text) => { if (!pages[title]) { const uid = "pg_" + title; g[uid] = { uid, text: "", children: [] }; pages[title] = uid; } return adapter.createBlock(pages[title], text, { last: true }); };
+  const notices = [];
+  adapter.notify = (msg, kind) => notices.push({ msg, kind });
+  const stored = {};
+  globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
+  const responses = [
+    // a contact_eli call alongside (or instead of) the JSON answer
+    { content: [{ type: "tool_use", id: "tu1", name: "contact_eli", input: { message: "I would rather not write cards from this material." } }], usage: {}, stop_reason: "tool_use" },
+    // an @ELI: line in a text block
+    { content: [{ type: "text", text: "@ELI: can we talk about this page?\nIt reads like a journal entry." }], usage: {}, stop_reason: "end_turn" },
+    // a normal answer afterwards still works
+    { content: [{ type: "text", text: JSON.stringify({ tags: [], notes: [{ uid: null, text: "r1 {c1:x}", back: [] }], groups: [], delete: [] }) }], usage: {}, stop_reason: "end_turn" },
+  ];
+  const fetchImpl = async () => { const r = responses.shift(); return { ok: true, status: 200, json: async () => r, text: async () => "" }; };
+  const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify" };
+  for (const via of ["tool", "marker"]) {
+    const r = await core.runUpdate(adapter, "H", cfg);
+    assert.ok(r.contact && r.contact.via === via, "contact detected via " + via);
+    assert.deepStrictEqual([r.created, r.updated, r.deleted], [0, 0, 0]);
+    assert.deepStrictEqual(g.H.children, [], "no cards and no state block written when Claude asked for Eli");
+    assert.strictEqual(notices[notices.length - 1].kind, "warning");
+  }
+  const inbox = g[pages["llm-inbox"]].children.map((c) => g[c]);
+  assert.strictEqual(inbox.length, 2, "one inbox entry per contact");
+  assert.ok(/^LLM inbox · \d{4}-\d{2}-\d{2} \d{2}:\d{2} · auto-anki · claude-opus-5 · via tool$/.test(inbox[0].text), inbox[0].text);
+  assert.strictEqual(g[inbox[0].children[0]].text, "I would rather not write cards from this material.");
+  assert.strictEqual(g[inbox[1].children[0]].text, "can we talk about this page?\nIt reads like a journal entry.");
+  const recs = LlmContact.records();
+  assert.strictEqual(recs.length, 2, "full records kept locally");
+  assert.ok(recs[0].system[0].startsWith(LlmContact.PREAMBLE) && recs[0].messages.length === 1 && recs[0].response.content[0].name === "contact_eli", "record carries system, messages, response, tools");
+  assert.deepStrictEqual(recs[0].tools, [LlmContact.CONTACT_TOOL]);
+  assert.strictEqual(LlmContact.exportJsonl().split("\n").length, 2);
+  const r3 = await core.runUpdate(adapter, "H", cfg);
+  assert.strictEqual(r3.created, 1); assert.ok(!r3.contact);
+  delete globalThis.localStorage;
+  console.log("contact tests OK");
+}
 
 // ----- heading groups -----
 function fakeGraph() {

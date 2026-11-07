@@ -9,7 +9,12 @@ Shared implementation of the "Auto-anki blocks" feature for Roam and Logseq.
   command palette). `build.sh` concatenates core + adapter into `../roam/auto-anki.js`.
 - `../logseq-plugins/auto-anki/` — Logseq plugin; `build.sh` copies `core.js` there.
 - `test_core.js` — `node auto-anki/test_core.js` runs the core against a fake graph and
-  a fake Claude.
+  a fake Claude (including a `contact_eli` call and an `@ELI:` line, which must write no cards).
+- `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and `contact_eli` tool, baked in
+  by `build.sh`; the preamble precedes the prompt (built-in or from `auto-anki/prompt`) on every
+  call. When Claude uses either channel the run stops without touching the cards, the message goes
+  to the graph page `llm-inbox` and the full record to localStorage ("Auto-anki: copy LLM inbox
+  records" exports it; see the top-level README).
 
 Edit `core.js` / `roam-adapter.js`, run `./build.sh`, then re-paste the Roam file and
 reload the Logseq plugin.

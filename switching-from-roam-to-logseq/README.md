@@ -106,7 +106,10 @@ the JSON (`exports/mini-roundtrip.json` was the test file).
   `~/Backups/logseq/main-logseq-graph.git` and a plain file copy `~/Backups/logseq/main-logseq-graph/`
   (both outside iCloud), and deletes iCloud conflict copies (`name 2.md`) in the graph.
   Log: `~/Library/Logs/logseq-backup.log`. Needs Full Disk Access for `/bin/bash`
-  (System Settings → Privacy & Security), granted 2026-09-05.
+  (System Settings → Privacy & Security), granted 2026-09-05. `backup/install.sh` copies the
+  script and plist into place and reloads the agent (`--status` to check); `logseq-backup.sh
+  --dry-run` reports what a run would do without changing anything; optional overrides in
+  `~/Library/Application Support/LogseqBackup/config.env` (`GRAPH=`, `BACKUPS=`).
 - The sidecar map is stored gzipped (`roam-uid-map.json.gz`, 16 MB) because GitHub
   refuses files over 100 MB.
 - After the final import (a new folder): `git init` is done by the converter; add the

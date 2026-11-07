@@ -274,6 +274,13 @@
     overlay.append(box);
     document.body.append(overlay);
 
+    // Drafts are never lost: the query is saved as you type and comes back (selected, so typing
+    // replaces it) the next time the picker opens; it is cleared only when a page is chosen.
+    const DRAFT_KEY = "backwards-embed:query";
+    const draft = { get: () => { try { return localStorage.getItem(DRAFT_KEY) || ""; } catch (e) { return ""; } },
+      set: (v) => { try { if (v) localStorage.setItem(DRAFT_KEY, v); else localStorage.removeItem(DRAFT_KEY); } catch (e) {} } };
+    input.value = draft.get();
+
     let items = [], selected = 0;
     function render() {
       const q = input.value;
@@ -297,10 +304,11 @@
     function choose(i) {
       const it = items[i];
       if (it === undefined) return;
+      draft.set(""); // submitted: the draft has done its job
       close();
       onPick(typeof it === "string" ? it : it.create);
     }
-    input.addEventListener("input", () => { selected = 0; render(); });
+    input.addEventListener("input", () => { draft.set(input.value); selected = 0; render(); });
     input.addEventListener("keydown", (e) => {
       if (e.key === "ArrowDown") { e.preventDefault(); selected = Math.min(selected + 1, items.length - 1); render(); }
       else if (e.key === "ArrowUp") { e.preventDefault(); selected = Math.max(selected - 1, 0); render(); }
@@ -310,7 +318,7 @@
     });
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
     render();
-    setTimeout(() => input.focus(), 0);
+    setTimeout(() => { input.focus(); input.select(); }, 0);
   }
 
   // ---------- entry points ----------

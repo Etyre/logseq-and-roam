@@ -1,8 +1,17 @@
 // node claude-chat/test_core.js — exercises the shared core with a fake graph and a fake streaming Claude.
 const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
+require("../llm-contact/llm-contact.js");
 require("./core.js");
 const core = globalThis.ClaudeChatCore;
+const LlmContact = globalThis.LlmContact;
 const o = { triggerPages: ["claude in roam"], slashTriggers: ["/claude"], marker: "=>" };
+
+// ----- LLM inbox: the generated preamble and tool match the shared files word for word -----
+const SHARED = path.join(process.env.HOME, "Documents/agent-coding/shared");
+assert.strictEqual(LlmContact.PREAMBLE, fs.readFileSync(path.join(SHARED, "llm-system-prompt-preamble.md"), "utf8").trim(), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.CONTACT_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "contact_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
 
 // ----- triggers -----
 assert.strictEqual(core.slashTriggerAt("what about /claude", o), 7);
@@ -104,13 +113,20 @@ function fakeGraph() {
   console.log("writer tests OK");
 
   // ----- streaming + full conversation -----
-  const sse = (chunks) => {
+  const sse = (chunks, toolCall) => {
     const events = [`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: {} })}\n\n`,
       `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "server_tool_use", name: "web_search" } })}\n\n`,
       `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
       `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } })}\n\n`];
     for (const c of chunks) events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: c } })}\n\n`);
-    events.push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n`, `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } })}\n\n`, `event: message_stop\ndata: {"type":"message_stop"}\n\n`);
+    events.push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n`);
+    if (toolCall) { // a client tool call (contact_eli), its input streamed in pieces
+      const json = JSON.stringify(toolCall);
+      events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "tu1", name: "contact_eli", input: {} } })}\n\n`);
+      for (let i = 0; i < json.length; i += 5) events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: json.slice(i, i + 5) } })}\n\n`);
+      events.push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n`);
+    }
+    events.push(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: toolCall ? "tool_use" : "end_turn" }, usage: { output_tokens: 9 } })}\n\n`, `event: message_stop\ndata: {"type":"message_stop"}\n\n`);
     const raw = events.join("");
     const enc = new TextEncoder();
     const body = new ReadableStream({ start(ctl) { for (let i = 0; i < raw.length; i += 7) ctl.enqueue(enc.encode(raw.slice(i, i + 7))); ctl.close(); } });
@@ -133,7 +149,8 @@ function fakeGraph() {
   assert.strictEqual(r1.lastUid, reply[1].uid);
   const req = requests[0];
   assert.strictEqual(req.body.model, "claude-opus-5"); assert.strictEqual(req.body.output_config.effort, "low"); assert.strictEqual(req.body.stream, true);
-  assert.deepStrictEqual(req.body.tools, [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }]);
+  assert.deepStrictEqual(req.body.tools, [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, LlmContact.CONTACT_TOOL], "web search plus contact_eli");
+  assert.ok(req.body.system[0].text.startsWith(LlmContact.PREAMBLE + "\n\n"), "the shared preamble comes first, word for word");
   assert.strictEqual(req.body.fallbacks, "default"); assert.strictEqual(req.headers["anthropic-dangerous-direct-browser-access"], "true");
   assert.strictEqual(req.body.messages.length, 1);
   assert.ok(/CONTEXT[^\n]*\n- top\n  - mid\n\nREQUEST: why is the sky blue/.test(req.body.messages[0].content), req.body.messages[0].content);
@@ -175,5 +192,40 @@ function fakeGraph() {
   const f2 = await ad2.createBlock("T", "again?");
   await assert.rejects(core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: bad }), { uid: f2 }), /Claude API 500/);
   assert.deepStrictEqual(g2[f2].children.map((c) => g2[c].text), ["Error: Claude API 500: boom"]);
+
+  // ----- LLM inbox: Claude asks for Eli -> the turn stops, the message is recorded -----
+  const pages = {};
+  ad2.appendToPage = async (title, text) => { if (!pages[title]) { const uid = "pg_" + title; g2[uid] = { uid, text: "", children: [] }; pages[title] = uid; } return ad2.createBlock(pages[title], text); };
+  const notices = [];
+  ad2.notify = (msg, kind) => notices.push({ msg, kind });
+  const stored = {};
+  globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
+  // via the tool, with no text at all
+  replies.push([]);
+  const toolFetch = async (url, opts) => { requests.push({ body: JSON.parse(opts.body), headers: opts.headers }); return sse(replies.shift(), { message: "I would like to stop this thread." }); };
+  const f3 = await ad2.createBlock("T", "keep going");
+  ad2.focused = null;
+  const r3 = await core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: toolFetch }), { uid: f3 });
+  assert.ok(r3.contact && r3.contact.via === "tool" && r3.contact.message === "I would like to stop this thread.", "tool call rebuilt from streamed input_json_delta pieces");
+  assert.strictEqual(r3.stop, "tool_use");
+  assert.ok(g2[f3].children.map((c) => g2[c].text).some((t) => /^\*\*Claude asked to reach Eli\*\* \(recorded on \[\[llm-inbox\]\].*I would like to stop this thread\.$/.test(t)), JSON.stringify(g2[f3].children.map((c) => g2[c].text)));
+  assert.strictEqual(ad2.focused, null, "cursor is not moved into a stopped turn");
+  assert.strictEqual(notices[notices.length - 1].kind, "warning");
+  // via an @ELI: line in the streamed text (the text is still written as the reply)
+  replies.push(["- One point\n", "- @ELI: this page is", " about me, please read it first\n"]);
+  const f4 = await ad2.createBlock("T", "and?");
+  const r4 = await core.followUp(ad2, cfg, { uid: f4 });
+  assert.ok(r4.contact && r4.contact.via === "marker" && r4.contact.message === "this page is about me, please read it first");
+  assert.strictEqual(g2[f4].children.length, 3, "reply blocks plus the notice");
+  const inbox = g2[pages["llm-inbox"]].children.map((c) => g2[c]);
+  assert.strictEqual(inbox.length, 2);
+  assert.ok(/^LLM inbox · .* · claude-in-roam · claude-opus-5 · via tool$/.test(inbox[0].text), inbox[0].text);
+  assert.strictEqual(g2[inbox[0].children[0]].text, "I would like to stop this thread.");
+  const recs = LlmContact.records();
+  assert.strictEqual(recs.length, 2, "full records kept locally");
+  assert.ok(recs[0].system.startsWith(LlmContact.PREAMBLE) && recs[0].messages[recs[0].messages.length - 1].content === "keep going" && recs[0].response.content[1].name === "contact_eli", "record carries system, messages, response, tools");
+  assert.strictEqual(recs[0].tools.length, 2);
+  delete globalThis.localStorage;
+  console.log("contact tests OK");
   console.log("core tests OK");
 })().catch((e) => { console.error(e); process.exit(1); });

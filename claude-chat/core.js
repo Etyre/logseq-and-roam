@@ -10,14 +10,25 @@
  *         nested reply bullet
  *     user follow-up                            <- typed by the user; Enter asks again
  *       reply bullet                            <- its children are the reply
+ *
+ * Config: Roam keeps the API key in this browser's localStorage ("claude-in-roam:apiKey",
+ * falling back to "auto-anki:apiKey") and the rest in the CONFIG object of roam-adapter.js;
+ * Logseq keeps everything in the plugin settings (~/.logseq/settings/logseq-claude-in-logseq.json).
+ * Logs: the browser / Logseq developer console, prefixed "[claude-in-roam]" or "[claude-in-logseq]";
+ * errors are also written into the graph where the reply would have gone. Every system prompt
+ * starts with the shared preamble and every call carries the contact_eli tool (llm-contact.js,
+ * loaded before this file); when Claude uses either, the turn stops and the message is written to
+ * the graph page "llm-inbox" and kept in localStorage ("llm-inbox:records").
  */
 (function (root) {
+  const contact = () => { if (!root.LlmContact) throw new Error("llm-contact.js is not loaded (rebuild: claude-chat/build.sh)"); return root.LlmContact; };
   const settings = {
     triggerPages: ["claude in roam", "cl:"], // [[page]] references that start a conversation; the first heads the block
     slashTriggers: ["/claude"], // typed text that starts a conversation
     marker: "=>", // block holding the first reply
     platform: "Roam Research",
     markup: "**bold**, __italics__, `code` and [[Page]] links",
+    app: "claude-in-roam", // name recorded in the LLM inbox
   };
 
   // ---------- text helpers ----------
@@ -154,7 +165,9 @@ FORMAT (strict, the reply is written into outliner blocks):
       output_config: { effort: effort || "low" },
       fallbacks: "default",
     };
-    if (webSearch) body.tools = [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }];
+    body.tools = [];
+    if (webSearch) body.tools.push({ type: "web_search_20260209", name: "web_search", max_uses: 5 });
+    body.tools.push(contact().CONTACT_TOOL); // the preamble promises Claude a way to reach Eli
     const headers = {
       "content-type": "application/json",
       "x-api-key": apiKey,
@@ -170,16 +183,28 @@ FORMAT (strict, the reply is written into outliner blocks):
       res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body), signal });
     }
     if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
-    return readSse(res, onText);
+    const r = await readSse(res, onText);
+    r.request = { model: body.model, system: systemText, messages, tools: body.tools };
+    return r;
   }
 
+  /**
+   * Read the SSE stream. Returns { text, usage, stop, content }: text is every text block
+   * joined (streamed to onText as it arrives); content is the text plus any client tool calls
+   * (only contact_eli is offered), rebuilt from their input_json_delta pieces.
+   */
   async function readSse(res, onText) {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "", text = "", usage = null, stop = null, textBlocks = new Set();
+    const toolBlocks = new Map(); // index -> { type: "tool_use", id, name, json }
     const handle = (ev) => {
-      if (ev.type === "content_block_start") { if (ev.content_block && ev.content_block.type === "text") textBlocks.add(ev.index); }
+      if (ev.type === "content_block_start") {
+        if (ev.content_block && ev.content_block.type === "text") textBlocks.add(ev.index);
+        else if (ev.content_block && ev.content_block.type === "tool_use") toolBlocks.set(ev.index, { type: "tool_use", id: ev.content_block.id, name: ev.content_block.name, json: "" });
+      }
       else if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta" && textBlocks.has(ev.index)) { text += ev.delta.text; if (onText) onText(ev.delta.text); }
+      else if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "input_json_delta" && toolBlocks.has(ev.index)) { toolBlocks.get(ev.index).json += ev.delta.partial_json || ""; }
       else if (ev.type === "message_delta") { if (ev.usage) usage = ev.usage; if (ev.delta && ev.delta.stop_reason) stop = ev.delta.stop_reason; if (ev.delta && ev.delta.stop_reason === "refusal") throw new Error("Claude declined the request" + (ev.delta.stop_details && ev.delta.stop_details.explanation ? ": " + ev.delta.stop_details.explanation : "")); }
       else if (ev.type === "error") throw new Error("Claude API stream error: " + JSON.stringify(ev.error || ev));
     };
@@ -199,7 +224,28 @@ FORMAT (strict, the reply is written into outliner blocks):
         }
       }
     }
-    return { text, usage, stop };
+    const content = [{ type: "text", text }];
+    for (const t of toolBlocks.values()) { let input = {}; try { input = JSON.parse(t.json || "{}"); } catch (e) { input = { raw: t.json }; } content.push({ type: "tool_use", id: t.id, name: t.name, input }); }
+    return { text, usage, stop, content };
+  }
+
+  /**
+   * After a reply: did Claude ask for Eli? If so, record it (localStorage + the graph page
+   * "llm-inbox"), make it visible under the reply, tell the user, and return the record so the
+   * caller stops the task (no retry, no further turns). Returns null otherwise.
+   */
+  async function afterResponse(adapter, cfg, r, replyUnder) {
+    const C = contact();
+    const rec = C.check({ app: cfg.app || settings.app, model: r.request.model, system: r.request.system, messages: r.request.messages, response: { content: r.content, stop_reason: r.stop, usage: r.usage }, tools: r.request.tools });
+    if (!rec) return null;
+    const page = C.pageBlocks(rec);
+    try {
+      if (adapter.appendToPage) { const uid = await adapter.appendToPage(cfg.inboxPage || C.INBOX_PAGE, page.text); for (const c of page.children) await adapter.createBlock(uid, c, { last: true }); }
+    } catch (e) { console.error("[claude-chat] could not write to the inbox page", e); }
+    try { await adapter.createBlock(replyUnder, `**Claude asked to reach Eli** (recorded on [[${cfg.inboxPage || C.INBOX_PAGE}]]; this turn stops here): ${rec.message}`, { last: true }); } catch (e) {}
+    if (adapter.notify) { try { adapter.notify(`Claude asked to reach Eli: ${rec.message.slice(0, 200)} (recorded on ${cfg.inboxPage || C.INBOX_PAGE})`, "warning"); } catch (e) {} }
+    console.warn("[claude-chat] contact recorded", rec.id, rec.message);
+    return rec;
   }
 
   // ---------- outline writer: streamed markdown -> blocks, as the lines arrive ----------
@@ -342,11 +388,14 @@ FORMAT (strict, the reply is written into outliner blocks):
       const placeholderUid = await adapter.createBlock(replyUnder, cfg.thinkingText || "…", { last: true });
       writer = makeWriter(adapter, replyUnder, { placeholderUid, throttleMs: cfg.throttleMs });
       if (adapter.onBusy) adapter.onBusy(convUid, true);
-      const r = await streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText: cfg.systemText || system(cfg), messages, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t) });
+      // the shared preamble always comes first, then the project's own instructions
+      const systemText = contact().systemPrompt(cfg.systemText || system(cfg));
+      const r = await streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText, messages, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t) });
       const w = await writer.finish();
+      const rec = await afterResponse(adapter, cfg, r, replyUnder);
       // leave the cursor at the end of the reply (the adapter may decline, e.g. if the user is typing elsewhere)
-      if (cfg.focusAfterReply !== false && adapter.focusBlock && w.uids.length) { try { await adapter.focusBlock(w.uids[w.uids.length - 1], true); } catch (e) { console.warn("[claude-chat] focus", e); } }
-      return { blocks: w.count, usage: r.usage, stop: r.stop, text: r.text, lastUid: w.uids[w.uids.length - 1] || null };
+      if (!rec && cfg.focusAfterReply !== false && adapter.focusBlock && w.uids.length) { try { await adapter.focusBlock(w.uids[w.uids.length - 1], true); } catch (e) { console.warn("[claude-chat] focus", e); } }
+      return { blocks: w.count, usage: r.usage, stop: r.stop, text: r.text, lastUid: w.uids[w.uids.length - 1] || null, contact: rec };
     } catch (e) {
       // leave the error where the reply would have been, so a failure is never silent
       try { if (writer) await writer.fail(e.message); else await adapter.createBlock(replyUnder, "Error: " + e.message, { last: true }); } catch (e2) {}
@@ -406,7 +455,7 @@ FORMAT (strict, the reply is written into outliner blocks):
 
   root.ClaudeChatCore = {
     settings, norm, outline, prune, isConversation, slashTriggerAt, pageTriggerIn, stripTrigger, header, isMarker,
-    system, contextMessage, buildMessages, streamClaude, readSse, parseLine, makeWriter,
+    system, contextMessage, buildMessages, streamClaude, readSse, afterResponse, parseLine, makeWriter,
     surroundings, respond, start, followUp, isFollowUpCandidate, isLockedReply, isLockedBlock, isBusy: (uid) => busy.has(uid),
   };
 })(typeof window !== "undefined" ? window : globalThis);

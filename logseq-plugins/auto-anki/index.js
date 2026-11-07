@@ -5,6 +5,11 @@
  * are the source material; its children are the Anki notes the LLM writes in
  * ankify_logseq format. Update with the small button on the block, the command palette
  * or the block context menu. Notes you edit change colour and are never touched again.
+ *
+ * Config: the plugin settings (Logseq → Plugins → Auto-anki → settings; stored in
+ * ~/.logseq/settings/logseq-auto-anki.json), including the API key; the prompt and the
+ * examples are graph pages. Logs: the Logseq developer console, prefixed "[auto-anki]".
+ * LLM inbox: see core.js / llm-contact.js.
  */
 
 const SETTINGS = [
@@ -121,6 +126,7 @@ const adapter = {
     await logseq.Editor.upsertBlockProperty(b.uuid, "id", b.uuid);
     return b.uuid;
   },
+  notify(msg, kind) { logseq.UI.showMsg(msg, kind || "info", { timeout: 10000 }); },
 };
 
 // ---------- DOM decoration ----------
@@ -199,6 +205,7 @@ async function update(uid, quiet) {
   try {
     const r = await core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
     statusCache.delete(uid);
+    if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
     if (!quiet) logseq.UI.showMsg(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
   } catch (e) {
     console.error("[auto-anki]", e);
@@ -258,6 +265,11 @@ function main() {
   logseq.App.registerCommandPalette({ key: "auto-anki-update", label: "Auto-anki: update cards" }, () => runCommand(null));
   logseq.Editor.registerBlockContextMenuItem("Auto-anki: update cards", (ctx) => runCommand(ctx));
   logseq.App.registerCommandPalette({ key: "auto-anki-open-examples", label: "Auto-anki: open examples" }, () => adapter.openPage(S().examplesPage || "auto-anki/examples"));
+  // records kept in this plugin's storage when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  logseq.App.registerCommandPalette({ key: "auto-anki-copy-inbox", label: "Auto-anki: copy LLM inbox records" }, async () => {
+    const r = await globalThis.LlmContact.copyRecords();
+    logseq.UI.showMsg(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this plugin", "info");
+  });
   logseq.App.registerCommandPalette({ key: "auto-anki-edit-prompt", label: "Auto-anki: edit prompt" }, async () => {
     const title = S().promptPage || "auto-anki/prompt";
     try {

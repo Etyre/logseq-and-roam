@@ -1,3 +1,15 @@
+"""ankify_logseq command line: sync blocks tagged #ankify in a Logseq file graph to Anki
+through AnkiConnect (localhost:8765; Anki must be open with the AnkiConnect add-on).
+
+    ankify_logseq check  GRAPH_DIR                      # parse only, report ankify blocks (no Anki)
+    ankify_logseq add    GRAPH_DIR --deck "My deck" --dry-run
+    ankify_logseq add    GRAPH_DIR --deck "My deck"
+    ankify_logseq init-models                           # create the Roam Basic / Roam Cloze note types
+
+Config: command-line options only (no config file yet; DESIGN.md §2.3 reserves
+~/.ankify_logseq/config.toml for deck aliases). State: none, Anki is the record; notes are
+matched by their `logseq uid` field. Logs: stdout, one timestamped line per step.
+"""
 import argparse
 import logging
 import os
