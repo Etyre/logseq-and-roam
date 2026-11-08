@@ -407,11 +407,123 @@ MAINTENANCE
   }
 
   // ---------- Claude API (raw HTTP: this runs inside a browser tab / plugin iframe with no bundler) ----------
-  async function callClaude({ apiKey, model, effort, system, user, fetchImpl }) {
+  /** Read a Messages API event stream into the shape of a non-streamed response; onText gets every text delta as it arrives. */
+  async function readStream(res, onText) {
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", usage = null, stop_reason = null, stop_details = null, model = null;
+    const blocks = new Map(); // index -> { type: "text", text } | { type: "tool_use", id, name, json }
+    const handle = (ev) => {
+      if (ev.type === "message_start" && ev.message) { usage = ev.message.usage || usage; model = ev.message.model || model; }
+      else if (ev.type === "content_block_start" && ev.content_block) {
+        const b = ev.content_block;
+        blocks.set(ev.index, b.type === "tool_use" ? { type: "tool_use", id: b.id, name: b.name, json: "" } : { type: b.type, text: b.text || "" });
+      } else if (ev.type === "content_block_delta" && ev.delta && blocks.has(ev.index)) {
+        const b = blocks.get(ev.index);
+        if (ev.delta.type === "text_delta" && b.type === "text") { b.text += ev.delta.text || ""; if (onText && ev.delta.text) onText(ev.delta.text); }
+        else if (ev.delta.type === "input_json_delta" && b.type === "tool_use") b.json += ev.delta.partial_json || "";
+      } else if (ev.type === "message_delta") {
+        if (ev.usage) usage = Object.assign({}, usage, ev.usage);
+        if (ev.delta && ev.delta.stop_reason) stop_reason = ev.delta.stop_reason;
+        if (ev.delta && ev.delta.stop_details) stop_details = ev.delta.stop_details;
+      } else if (ev.type === "error") throw new Error("Claude API stream error: " + JSON.stringify(ev.error || ev));
+    };
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === "[DONE]") continue;
+          let ev; try { ev = JSON.parse(data); } catch (e) { continue; }
+          handle(ev);
+        }
+      }
+    }
+    const content = [];
+    for (const b of blocks.values()) {
+      if (b.type === "tool_use") { let input = {}; try { input = JSON.parse(b.json || "{}"); } catch (e) { input = { raw: b.json }; } content.push({ type: "tool_use", id: b.id, name: b.name, input }); }
+      else content.push({ type: "text", text: b.text || "" });
+    }
+    return { content, usage, stop_reason, stop_details, model };
+  }
+
+  /**
+   * Incremental scanner over the model's JSON answer as it streams in. Calls onNote(note, groups) the
+   * moment an object inside a "notes" array is complete: note is that object parsed, with note.path
+   * locating it in the finished answer (e.g. ["groups", 1, "notes", 0]); groups is the chain of
+   * enclosing heading objects, outermost first, each {path, uid, title} as far as the text has got
+   * (title/uid null when the heading's header has not streamed yet). Tolerates any chunking.
+   */
+  function jsonNoteScanner(onNote) {
+    let buf = "", pos = 0, inStr = false, esc = false, strStart = -1;
+    const stack = []; // { type: "obj"|"arr", start, key (in the parent), count (array elements before the current one), expectKey, curKey }
+    const pathOf = (frames) => frames.map((f) => f.key).filter((k) => k !== undefined);
+    const header = (f, upto) => { // a heading's own "uid" and "title": the part of its text before its "notes"/"groups" key
+      let t = buf.slice(f.start, upto);
+      const cut = t.search(/"(notes|groups)"\s*:/);
+      if (cut >= 0) t = t.slice(0, cut);
+      const tm = /"title"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(t), um = /"uid"\s*:\s*(null|"(?:[^"\\]|\\.)*")/.exec(t);
+      let title = null, uid = null;
+      try { if (tm) title = JSON.parse('"' + tm[1] + '"'); if (um) uid = JSON.parse(um[1]); } catch (e) {}
+      return { title, uid };
+    };
+    return {
+      feed(chunk) {
+        buf += chunk;
+        for (; pos < buf.length; pos++) {
+          const c = buf[pos];
+          if (inStr) {
+            if (esc) esc = false;
+            else if (c === "\\") esc = true;
+            else if (c === '"') {
+              inStr = false;
+              const top = stack[stack.length - 1];
+              if (top && top.type === "obj" && top.expectKey) { try { top.curKey = JSON.parse(buf.slice(strStart, pos + 1)); } catch (e) { top.curKey = undefined; } top.expectKey = false; }
+            }
+            continue;
+          }
+          if (c === '"') { inStr = true; esc = false; strStart = pos; continue; }
+          const top = stack[stack.length - 1];
+          if (c === "{" || c === "[") {
+            const key = top ? (top.type === "obj" ? top.curKey : top.count) : undefined;
+            stack.push({ type: c === "{" ? "obj" : "arr", start: pos, key, count: 0, expectKey: c === "{", curKey: undefined });
+          } else if (c === "}" || c === "]") {
+            const f = stack.pop();
+            if (!f) continue;
+            const parent = stack[stack.length - 1];
+            if (f.type === "obj" && parent && parent.type === "arr" && parent.key === "notes") {
+              let note = null;
+              try { note = JSON.parse(buf.slice(f.start, pos + 1)); } catch (e) {}
+              if (note && typeof note === "object") {
+                const groups = [], seen = [];
+                for (const fr of stack) {
+                  seen.push(fr);
+                  const under = seen[seen.length - 2];
+                  if (fr.type === "obj" && under && under.type === "arr" && under.key === "groups") groups.push(Object.assign({ path: pathOf(seen) }, header(fr, f.start)));
+                }
+                note.path = pathOf([...stack, f]);
+                onNote(note, groups);
+              }
+            }
+          } else if (c === ",") { if (top) { if (top.type === "obj") top.expectKey = true; else top.count++; } }
+        }
+      },
+      text: () => buf,
+    };
+  }
+
+  /** One call; the answer streams in and onText gets each piece of the model's text as it arrives. */
+  async function callClaude({ apiKey, model, effort, system, user, fetchImpl, onText }) {
     const f = fetchImpl || root.fetch.bind(root);
     const body = {
       model: model || "claude-opus-5",
       max_tokens: 16000,
+      stream: true,
       system: (Array.isArray(system) ? system : [system]).filter(Boolean).map((t) => ({ type: "text", text: t, cache_control: { type: "ephemeral" } })),
       messages: [{ role: "user", content: user }],
       tools: [contact().CONTACT_TOOL], // the preamble promises Claude a way to reach Eli
@@ -434,7 +546,9 @@ MAINTENANCE
       res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
     }
     if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
-    const data = await res.json();
+    let data;
+    if (res.body && typeof res.body.getReader === "function") data = await readStream(res, onText);
+    else { data = await res.json(); if (onText) for (const b of data.content || []) if (b.type === "text" && b.text) onText(b.text); } // a plain JSON reply (tests)
     if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
     const request = { model: body.model, system: body.system.map((b) => b.text), messages: body.messages, tools: body.tools };
     // Claude asked for Eli (contact_eli call or an "@ELI:" line): no result, the caller stops
@@ -572,13 +686,72 @@ MAINTENANCE
       const examples = await examplesText(adapter);
       // the shared preamble always comes first, then the project's own (possibly user-edited) prompt
       const systemBlocks = [contact().systemPrompt(system), examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
-      const { result, usage, contact: rec } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
-      if (rec) { await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
+      // where a new block goes: under a heading, or under the home block just above the state block
+      const placement = (parentUid) => (parentUid === homeUid && stateBlock ? { before: stateBlock.uid } : { last: true });
+
+      // New notes (and the headings they sit under) are written the moment the model finishes each one,
+      // so the cards fill in block by block instead of all at once after a minutes-long call. Everything
+      // written this way is rolled back if the call fails or Claude asks for Eli. Existing notes (updates,
+      // moves, deletions, retitled headings) wait for the complete answer and the planner below.
+      const existing = new Map(notes.map((n) => [n.uid, n]));
+      const live = { notes: new Map(), groups: new Map(), made: new Map(), created: [] }; // path -> uid; made: heading uid -> title; created: every uid written, in order
+      const claimed = new Set();
+      const pkey = (p) => p.join("/");
+      let queue = Promise.resolve(), streamError = null;
+      const liveHeading = async (chain) => { // the heading a streamed note goes under, made on the way; null = its title has not streamed yet (left to the planner)
+        let parentUid = homeUid;
+        for (const g of chain) {
+          const k = pkey(g.path);
+          let uid = live.groups.get(k);
+          if (!uid) {
+            if (g.uid && groupIndex.has(g.uid) && !claimed.has(g.uid)) { claimed.add(g.uid); uid = g.uid; }
+            else {
+              if (!g.title) return null;
+              uid = await adapter.createBlock(parentUid, g.title, placement(parentUid));
+              live.created.push(uid); live.made.set(uid, g.title);
+            }
+            live.groups.set(k, uid);
+          }
+          parentUid = uid;
+        }
+        return parentUid;
+      };
+      const onNote = (raw, chain) => {
+        queue = queue.then(async () => {
+          if (streamError || (raw.uid && existing.has(raw.uid))) return;
+          const text = ensureAnkifyTag(normaliseCloze(raw.text || "").trim(), cfg.ankifyTag);
+          const back = (raw.back || []).map((b) => normaliseCloze(String(b)).trim()).filter(Boolean);
+          if (!norm(text)) return;
+          const target = await liveHeading(chain);
+          if (target === null) return;
+          const uid = await adapter.createBlock(target, text, placement(target));
+          live.created.push(uid);
+          const children = [];
+          for (const b of back) children.push({ uid: await adapter.createBlock(uid, b, { last: true }), text: b });
+          live.notes.set(pkey(raw.path), { uid, text, children, groupUid: target === homeUid ? null : target });
+          if (adapter.progress) { try { adapter.progress(homeUid, live.notes.size); } catch (e) {} }
+        }).catch((e) => { streamError = streamError || e; });
+      };
+      const rollback = async () => { for (const uid of [...live.created].reverse()) { try { await adapter.deleteBlock(uid); } catch (e) { console.error("[auto-anki] rollback", e); } } live.created = []; };
+      const scanner = jsonNoteScanner(onNote);
+      let call;
+      try {
+        call = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl, onText: (t) => scanner.feed(t) });
+        await queue;
+        if (streamError) throw streamError;
+      } catch (e) { await queue; await rollback(); throw e; }
+      const { result, usage, contact: rec } = call;
+      if (rec) { await rollback(); await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
+      // what streamed in exists now: give the planner those uids so it leaves the blocks alone
+      for (const [uid, title] of live.made) groupIndex.set(uid, { uid, text: title, notes: [], groups: [] });
+      const adopt = (obj, path) => {
+        (obj.notes || []).forEach((raw, i) => { const ln = live.notes.get(pkey([...path, "notes", i])); if (ln) { raw.uid = ln.uid; notes.push(ln); } });
+        (obj.groups || []).forEach((g, i) => { const p = [...path, "groups", i]; const uid = live.groups.get(pkey(p)); if (uid) g.uid = uid; adopt(g, p); });
+      };
+      adopt(result, []);
       const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
 
       const byUid = new Map(notes.map((n) => [n.uid, n]));
-      // where a new block goes: under a heading, or under the home block just above the state block
-      const placement = (parentUid) => (parentUid === homeUid && stateBlock ? { before: stateBlock.uid } : { last: true });
       // headings first, so every note has a parent to go to
       const ensureGroup = async (g, parentUid) => {
         if (g.uid) {
@@ -610,6 +783,8 @@ MAINTENANCE
         state.notes[uid] = { hash: fingerprint({ text: c.text, children: c.back.map((t) => ({ text: t })) }), text: stripTag(c.text, cfg.ankifyTag), back: c.back, at: Date.now() };
       }
       for (const uid of ops.deletes) { await adapter.deleteBlock(uid); delete state.notes[uid]; }
+      for (const ln of live.notes.values()) state.notes[ln.uid] = { hash: fingerprint(ln), text: stripTag(ln.text, cfg.ankifyTag), back: ln.children.map((c) => c.text), at: Date.now() };
+      for (const [uid, title] of live.made) state.groups[uid] = { text: title };
       await pruneGroups(adapter, homeUid, state, cfg.ankifyTag);
       if (ops.tags.length || (state.llmTags || []).length) {
         const newText = homeTextWithTags(home.text, state.llmTags, ops.tags);
@@ -619,7 +794,7 @@ MAINTENANCE
       state.contentHash = contentHash(contentTrees);
       state.updatedAt = Date.now();
       await writeState(adapter, homeUid, stateBlock, state);
-      return { created: ops.creates.length, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
+      return { created: ops.creates.length + live.notes.size, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
     } finally {
       busy.delete(homeUid);
     }
@@ -661,7 +836,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, recordContact, plan, pruneGroups,
+    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);

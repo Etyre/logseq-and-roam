@@ -127,6 +127,11 @@ const adapter = {
     return b.uuid;
   },
   notify(msg, kind) { logseq.UI.showMsg(msg, kind || "info", { timeout: 10000 }); },
+  progress(homeUid, n) { // cards written so far while the answer streams in
+    const el = homeElements().find((x) => x.getAttribute("blockid") === homeUid);
+    const span = el && el.querySelector(":scope > .auto-anki-bar .auto-anki-count");
+    if (span) span.textContent = `${n} written…`;
+  },
 };
 
 // ---------- DOM decoration ----------

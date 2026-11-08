@@ -215,8 +215,8 @@ async function contactTests() {
 }
 
 // ----- heading groups -----
-function fakeGraph() {
-  const g = { P: { uid: "P", text: "", children: ["c1", "H"] }, c1: { uid: "c1", text: "Lots of facts about rivers", children: [] }, H: { uid: "H", text: "#[[auto-generate cards]]", children: [] } };
+function fakeGraph(home = "H") { // the test blocks run concurrently and busy is per home uid, so each block gets its own
+  const g = { P: { uid: "P", text: "", children: ["c1", home] }, c1: { uid: "c1", text: "Lots of facts about rivers", children: [] }, [home]: { uid: home, text: "#[[auto-generate cards]]", children: [] } };
   let n = 0;
   const tree = (uid) => ({ uid, text: g[uid].text, children: g[uid].children.map(tree) });
   const parentOf = (uid) => Object.keys(g).find((k) => g[k].children.includes(uid));
@@ -342,4 +342,127 @@ async function groupingTests() {
   assert.strictEqual(r.created, 1);
   assert.ok(!core.isBusy("HB"), "not busy once the run is over");
   console.log("busy tests OK");
+})().catch((e) => { console.error(e); process.exit(1); });
+
+// ----- streaming: cards are written while the answer is still arriving -----
+{
+  const got = [];
+  const sc = core.jsonNoteScanner((n, groups) => got.push({ text: n.text, path: n.path, groups: groups.map((g) => [g.title, g.uid, g.path.join("/")]) }));
+  const doc = JSON.stringify({ tags: ["x"], notes: [{ uid: null, text: "top {c1:a}", back: [] }], groups: [
+    { uid: "G1", title: "Rivers \"long\" {and} [odd]", notes: [{ uid: null, text: "n1", back: ["b1", "b2"] }, { uid: "e1", text: "n2", back: [] }], groups: [] },
+    { uid: null, title: "Nested", notes: [], groups: [{ uid: null, title: "Inner", notes: [{ uid: null, text: "deep", back: [] }] }] },
+  ], delete: ["e2"] });
+  for (let i = 0; i < doc.length; i += 7) sc.feed(doc.slice(i, i + 7)); // any chunking
+  assert.deepStrictEqual(got, [
+    { text: "top {c1:a}", path: ["notes", 0], groups: [] },
+    { text: "n1", path: ["groups", 0, "notes", 0], groups: [["Rivers \"long\" {and} [odd]", "G1", "groups/0"]] },
+    { text: "n2", path: ["groups", 0, "notes", 1], groups: [["Rivers \"long\" {and} [odd]", "G1", "groups/0"]] },
+    { text: "deep", path: ["groups", 1, "groups", 0, "notes", 0], groups: [["Nested", null, "groups/1"], ["Inner", null, "groups/1/groups/0"]] },
+  ]);
+  console.log("scanner tests OK");
+}
+
+/** A fake streamed Messages API response: text blocks arrive as text deltas, tool blocks as JSON deltas; onChunk runs before every network chunk. */
+function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
+  const events = [{ type: "message_start", message: { usage: { input_tokens: 1 }, model: "claude-opus-5" } }];
+  content.forEach((b, index) => {
+    if (b.type === "text") {
+      events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+      for (let i = 0; i < b.text.length; i += 9) events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: b.text.slice(i, i + 9) } });
+    } else {
+      events.push({ type: "content_block_start", index, content_block: { type: "tool_use", id: b.id, name: b.name } });
+      events.push({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) } });
+    }
+    events.push({ type: "content_block_stop", index });
+  });
+  events.push({ type: "message_delta", delta: { stop_reason }, usage: { output_tokens: 5 } }, { type: "message_stop" });
+  const wire = events.map((ev) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`).join("");
+  const enc = new TextEncoder();
+  let at = 0;
+  const body = new ReadableStream({
+    async pull(ctrl) {
+      await new Promise((r) => setTimeout(r, 0)); // let queued writes land between chunks, as they would over a real network
+      if (at >= wire.length) { ctrl.close(); return; }
+      if (onChunk) await onChunk();
+      ctrl.enqueue(enc.encode(wire.slice(at, at + 13))); at += 13; // frames split across reads
+    },
+  });
+  return { ok: true, status: 200, body, text: async () => "", json: async () => { throw new Error("streamed replies have no json()"); } };
+}
+
+(async () => {
+  const note = (text, uid = null, back = []) => ({ uid, text, back });
+  const textBlock = (answer) => ({ type: "text", text: JSON.stringify(answer) });
+  // 1) a fresh block: eight notes under headings stream in one by one
+  {
+    const { g, adapter } = fakeGraph("HS");
+    const answer = { tags: ["rivers"], notes: [], groups: [
+      { uid: null, title: "Lengths", notes: [note("Nile {c1:6650 km}"), note("Longest river?", null, ["Nile"]), note("Amazon {c1:6400 km}")], groups: [] },
+      { uid: null, title: "Places", notes: [], groups: [{ uid: null, title: "Sources", notes: [note("Nile source {c1:Lake Victoria}"), note("Amazon source {c1:Andes}")] }] },
+      { uid: null, title: "Misc", notes: [note("m1 {c1:x}"), note("m2 {c1:y}"), note("m3 {c1:z}")], groups: [] },
+    ], delete: [] };
+    const sizes = [];
+    const progress = [];
+    adapter.progress = (uid, n) => progress.push(n);
+    const fetchImpl = async () => sseResponse({ content: [textBlock(answer)] }, () => sizes.push(Object.keys(g).length));
+    const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify", grouping: { threshold: 6, min: 2, max: 6 } };
+    const r = await core.runUpdate(adapter, "HS", cfg);
+    assert.deepStrictEqual([r.created, r.updated, r.deleted], [8, 0, 0]);
+    assert.ok(new Set(sizes).size > 4, "the graph grew step by step while the answer was still streaming: " + sizes.join(","));
+    assert.deepStrictEqual(progress, [1, 2, 3, 4, 5, 6, 7, 8], "progress reported per note");
+    const H = g.HS.children.map((u) => g[u]);
+    assert.deepStrictEqual(H.map((b) => b.text).slice(0, 3), ["Lengths", "Places", "Misc"]);
+    assert.ok(core.isStateBlock(H[3].text) && H.length === 4, "state block last, nothing duplicated");
+    assert.deepStrictEqual(H[0].children.map((u) => g[u].text), ["Nile {c1:6650 km} #ankify", "Longest river? #ankify", "Amazon {c1:6400 km} #ankify"]);
+    assert.deepStrictEqual(g[H[0].children[1]].children.map((u) => g[u].text), ["Nile"]);
+    assert.strictEqual(g[H[1].children[0]].text, "Sources"); assert.strictEqual(g[H[1].children[0]].children.length, 2);
+    const state = core.parseState(H[3].text);
+    assert.strictEqual(Object.keys(state.notes).length, 8, "every streamed note is in the state");
+    assert.strictEqual(Object.keys(state.groups).length, 4, "every heading made on the way is in the state");
+    assert.ok(Object.values(state.notes).every((n) => !/ankify/.test(n.text)));
+    assert.strictEqual(g.HS.text, "#[[auto-generate cards]] #rivers");
+    // 2) second run: existing notes come back by uid, one new note joins an existing heading, one is deleted
+    const uidOf = (t) => Object.values(g).find((b) => b.text.startsWith(t)).uid;
+    const keep = (t) => { const b = g[uidOf(t)]; return { uid: b.uid, text: b.text.replace(/ #ankify$/, ""), back: b.children.map((c) => g[c].text) }; };
+    const answer2 = { tags: ["rivers"], notes: [], groups: [
+      { uid: uidOf("Lengths"), title: "Lengths", notes: [keep("Nile {c1"), keep("Longest"), keep("Amazon {c1"), note("Congo {c1:4700 km}")], groups: [] },
+      { uid: uidOf("Places"), title: "Places", notes: [], groups: [{ uid: uidOf("Sources"), title: "Sources", notes: [keep("Nile source"), keep("Amazon source")] }] },
+      { uid: uidOf("Misc"), title: "Misc", notes: [keep("m1"), keep("m2")], groups: [] },
+    ], delete: [uidOf("m3")] };
+    const before = g.HS.children.length;
+    const r2 = await core.runUpdate(adapter, "HS", { ...cfg, fetchImpl: async () => sseResponse({ content: [textBlock(answer2)] }) });
+    assert.deepStrictEqual([r2.created, r2.updated, r2.deleted], [1, 0, 1]);
+    assert.strictEqual(g.HS.children.length, before, "no heading duplicated");
+    assert.deepStrictEqual(g[uidOf("Lengths")].children.map((u) => g[u].text.replace(/ #ankify$/, "")), ["Nile {c1:6650 km}", "Longest river?", "Amazon {c1:6400 km}", "Congo {c1:4700 km}"]);
+    assert.deepStrictEqual(g[uidOf("Misc")].children.map((u) => g[u].text), ["m1 {c1:x} #ankify", "m2 {c1:y} #ankify"]);
+    assert.strictEqual(Object.keys(core.parseState(g[g.HS.children[g.HS.children.length - 1]].text).notes).length, 8);
+  }
+  // 3) the stream breaks half way: everything written so far is removed again
+  {
+    const { g, adapter } = fakeGraph("HS");
+    const answer = { tags: [], notes: [note("a {c1:1}"), note("b {c1:2}"), note("c {c1:3}"), note("d {c1:4}")], groups: [], delete: [] };
+    const snapshot = JSON.stringify(g);
+    let chunks = 0, peak = 0;
+    const fetchImpl = async () => sseResponse({ content: [textBlock(answer)] }, () => { peak = Math.max(peak, g.HS.children.length); if (++chunks === 120) throw new Error("connection lost"); });
+    await assert.rejects(core.runUpdate(adapter, "HS", { apiKey: "k", fetchImpl, ankifyTag: "ankify" }), /connection lost/);
+    assert.ok(peak > 0, "some cards had been written before the failure");
+    assert.strictEqual(JSON.stringify(g), snapshot, "graph back to how it was");
+    assert.ok(!core.isBusy("HS"));
+  }
+  // 4) Claude asks for Eli after some notes streamed: they are removed, nothing is kept
+  {
+    const { g, adapter } = fakeGraph("HS");
+    const pages = {};
+    adapter.appendToPage = async (title, text) => { if (!pages[title]) { const uid = "pg_" + title; g[uid] = { uid, text: "", children: [] }; pages[title] = uid; } return adapter.createBlock(pages[title], text, { last: true }); };
+    const stored = {};
+    globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
+    const answer = { tags: [], notes: [note("a {c1:1}"), note("b {c1:2}")], groups: [], delete: [] };
+    const fetchImpl = async () => sseResponse({ content: [textBlock(answer), { type: "tool_use", id: "tu9", name: "contact_eli", input: { message: "please stop" } }], stop_reason: "tool_use" });
+    const r = await core.runUpdate(adapter, "HS", { apiKey: "k", fetchImpl, ankifyTag: "ankify" });
+    assert.ok(r.contact && r.contact.via === "tool");
+    assert.deepStrictEqual(g.HS.children, [], "streamed cards rolled back when Claude asked for Eli");
+    assert.strictEqual(g[pages["llm-inbox"]].children.length, 1);
+    delete globalThis.localStorage;
+  }
+  console.log("streaming tests OK");
 })().catch((e) => { console.error(e); process.exit(1); });

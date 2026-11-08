@@ -50,7 +50,7 @@ README with the detail; this file is the map and the operating manual.
 | `README.md` | This file: map, runtime locations, commands, gotchas for the whole folder. |
 | `Claude-in-roam _ Claude-in-logseq.md` | Eli's original spec for the Claude-in-outliner feature. |
 | `claude-chat/` | "Claude in Roam / Logseq": `core.js` (triggers, prompt, streaming SSE reader, outline writer, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `README.md`. |
-| `auto-anki/` | "Auto-anki": `core.js` (state block, frozen notes, prompt, structured-output call, planner, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `card-principles.md`, `README.md`. |
+| `auto-anki/` | "Auto-anki": `core.js` (state block, frozen notes, prompt, streamed structured-output call that writes each card as it arrives, planner, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `card-principles.md`, `README.md`. |
 | `llm-contact/` | `build.sh` generates `llm-contact.js` (preamble, `contact_eli` tool, `extract`/`check`, local record store) from `template.js` and the shared files. Both other build scripts call it. |
 | `roam/` | Paste-in `roam/js` blocks: `claude-in-roam.js` and `auto-anki.js` (generated, do not edit), `backwards-embed.js`; `README.md` has the install steps. |
 | `logseq-plugins/` | One folder per unpacked Logseq plugin; `README.md` lists them. `claude-in-logseq/` and `auto-anki/` receive `core.js` and `llm-contact.js` from the build scripts. |

@@ -110,6 +110,11 @@
       return this.createBlock(p[":block/uid"], text, { last: true });
     },
     notify(msg, kind) { toast(msg, kind); },
+    progress(homeUid, n) { // cards written so far while the answer streams in
+      const c = homeContainers().find((x) => uidOf(x) === homeUid);
+      const el = c && c.querySelector(":scope > .auto-anki-bar .auto-anki-count");
+      if (el) el.textContent = `${n} written…`;
+    },
   };
 
   // ---------- styling ----------

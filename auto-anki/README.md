@@ -3,7 +3,8 @@
 Shared implementation of the "Auto-anki blocks" feature for Roam and Logseq.
 
 - `core.js` — platform-independent logic: state block format, edit detection (frozen
-  notes), prompt, Claude call (raw HTTP, structured JSON output), planning and applying
+  notes), prompt, Claude call (raw HTTP, streamed, structured JSON output), an incremental
+  JSON scanner that writes each new note as it arrives, planning and applying the rest of
   the model's answer through an adapter.
 - `roam-adapter.js` — Roam side (roamAlphaAPI reads/writes, styling, pull watches,
   command palette). `build.sh` concatenates core + adapter into `../roam/auto-anki.js`.
@@ -33,6 +34,7 @@ reload the Logseq plugin.
 | Examples | graph-wide page `auto-anki/examples` (setting). Every note that freezes gets an entry: `EDITED · date · page` with "LLM wrote: …" and "User's version: …" (kept current as the user keeps editing), `WRITTEN BY THE USER · …`, or `DELETED BY THE USER · …` with the LLM's text; deleting an edited note relabels its entry "…, THEN DELETED". The whole page is sent as a second (cached) system block with every request, so the model learns the user's taste over time. The user may prune or edit the page. |
 | Prompt | page `auto-anki/prompt` (setting); "Auto-anki: edit prompt" seeds it from the built-in text; empty/missing = built-in |
 | Off | a home block carrying an off tag (setting, default `auto-anki off`) or sitting inside a template definition (Roam: ancestor tagged `#roam/templates` or `#SmartBlock`; Logseq: ancestor with `template::`) is inactive: dashed grey border, no button, no tracking; commands refuse it. Blocks created from the template are active. |
+| Streaming | the answer streams in and every new note (and the heading it sits under) is written the moment the model finishes it, so the cards fill in block by block; the bar counts "N written…" meanwhile. Updates, moves and deletions of existing notes and heading retitles wait for the complete answer. If the call fails half way or Claude asks for Eli, the blocks written so far are deleted again, so a run is still all or nothing |
 | Stale dot | amber when the content hash differs from the last run |
 | Card count | the bar on the home block shows "N cards", plus "· k edited" when some notes are frozen; refreshed with the status |
 | Auto-update | off by default; when on, a run starts after the content has been quiet for N minutes |
