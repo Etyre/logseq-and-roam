@@ -203,7 +203,9 @@ async function update(uid, quiet) {
   if (core.isBusy(uid)) return;
   decorate();
   try {
-    const r = await core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
+    const run = core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
+    decorate(); // the core marked the block busy: show the pulsing dot while Claude works
+    const r = await run;
     statusCache.delete(uid);
     if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
     if (!quiet) logseq.UI.showMsg(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");

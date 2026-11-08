@@ -549,31 +549,33 @@ MAINTENANCE
   async function runUpdate(adapter, homeUid, cfg) {
     if (busy.has(homeUid)) throw new Error("already updating this block");
     if (!cfg.apiKey) throw new Error("no API key set");
-    const home = await adapter.getBlock(homeUid);
-    if (!home) throw new Error("home block not found");
-    if (!(await isActive(adapter, home))) throw new Error("this block is switched off (off tag or inside a template)");
-    const { notes, stateBlock, groups, groupIndex } = splitChildren(home.children, cfg.ankifyTag, homeUid);
-    const state = parseState(stateBlock && stateBlock.text);
-    const { vanished } = reconcile(state, notes);
-    try { await recordExamples(adapter, home, notes, state, vanished, cfg.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
-    const contentTrees = await adapter.getSiblingTrees(homeUid);
-    if (!outline(contentTrees).trim()) throw new Error("no content blocks next to the home block");
-    const hl = homeTagsLower();
-    const homeTags = lowerTags(home.text).filter((t) => !hl.includes(t));
-    const user = buildUserMessage({ pageTitle: home.pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions: cfg.extraInstructions, grouping: cfg.grouping });
-    let system = SYSTEM;
-    if (cfg.promptPage && adapter.readPageTrees) {
-      try { const custom = promptFromTrees(await adapter.readPageTrees(cfg.promptPage)); if (custom) system = custom; } catch (e) { console.warn("[auto-anki] prompt page unreadable, using the built-in prompt", e); }
-    }
-    const examples = await examplesText(adapter);
-    // the shared preamble always comes first, then the project's own (possibly user-edited) prompt
-    const systemBlocks = [contact().systemPrompt(system), examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
-    const { result, usage, contact: rec } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
-    if (rec) { await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
-    const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
-
+    // busy for the whole run, the API call included: refreshes do not persist meanwhile and a second
+    // click or auto-update cannot start a second run (the call takes minutes; two runs made every card twice)
     busy.add(homeUid);
     try {
+      const home = await adapter.getBlock(homeUid);
+      if (!home) throw new Error("home block not found");
+      if (!(await isActive(adapter, home))) throw new Error("this block is switched off (off tag or inside a template)");
+      const { notes, stateBlock, groups, groupIndex } = splitChildren(home.children, cfg.ankifyTag, homeUid);
+      const state = parseState(stateBlock && stateBlock.text);
+      const { vanished } = reconcile(state, notes);
+      try { await recordExamples(adapter, home, notes, state, vanished, cfg.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
+      const contentTrees = await adapter.getSiblingTrees(homeUid);
+      if (!outline(contentTrees).trim()) throw new Error("no content blocks next to the home block");
+      const hl = homeTagsLower();
+      const homeTags = lowerTags(home.text).filter((t) => !hl.includes(t));
+      const user = buildUserMessage({ pageTitle: home.pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions: cfg.extraInstructions, grouping: cfg.grouping });
+      let system = SYSTEM;
+      if (cfg.promptPage && adapter.readPageTrees) {
+        try { const custom = promptFromTrees(await adapter.readPageTrees(cfg.promptPage)); if (custom) system = custom; } catch (e) { console.warn("[auto-anki] prompt page unreadable, using the built-in prompt", e); }
+      }
+      const examples = await examplesText(adapter);
+      // the shared preamble always comes first, then the project's own (possibly user-edited) prompt
+      const systemBlocks = [contact().systemPrompt(system), examples ? "EXAMPLES — the user's past edits, own notes and deletions, oldest first:\n" + examples : ""];
+      const { result, usage, contact: rec } = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl });
+      if (rec) { await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
+      const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
+
       const byUid = new Map(notes.map((n) => [n.uid, n]));
       // where a new block goes: under a heading, or under the home block just above the state block
       const placement = (parentUid) => (parentUid === homeUid && stateBlock ? { before: stateBlock.uid } : { last: true });
@@ -617,10 +619,10 @@ MAINTENANCE
       state.contentHash = contentHash(contentTrees);
       state.updatedAt = Date.now();
       await writeState(adapter, homeUid, stateBlock, state);
+      return { created: ops.creates.length, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
     } finally {
       busy.delete(homeUid);
     }
-    return { created: ops.creates.length, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
   }
 
   /** Delete headings the LLM made that have nothing left below them; forget headings that are gone. */

@@ -317,3 +317,29 @@ async function groupingTests() {
   assert.ok(/at most 6/.test(msg) && /2 to 6 notes/.test(msg));
   console.log("grouping tests OK");
 }
+
+// ----- busy for the whole run, API call included (a second click must not start a second run) -----
+(async () => {
+  const g = { P: { uid: "P", text: "", children: ["c", "HB"] }, c: { uid: "c", text: "fact", children: [] }, HB: { uid: "HB", text: "#[[auto-generate cards]]", children: [] } };
+  const tree = (uid) => ({ uid, text: g[uid].text, children: g[uid].children.map(tree) });
+  const adapter = {
+    async getBlock(uid) { if (!g[uid]) return null; const t = tree(uid); t.parentUid = uid === "P" ? null : "P"; return t; },
+    async getSiblingTrees() { return [tree("c")]; },
+    async createBlock(p, text) { const uid = "b" + Object.keys(g).length; g[uid] = { uid, text, children: [] }; g[p].children.push(uid); return uid; },
+    async updateBlock(uid, text) { g[uid].text = text; },
+    async deleteBlock() {}, async collapse() {},
+  };
+  let release = null;
+  const answer = { tags: [], notes: [{ uid: null, text: "a {c1:b}", back: [] }], groups: [], delete: [] };
+  const fetchImpl = () => new Promise((res) => { release = () => res({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(answer) }], usage: {}, stop_reason: "end_turn" }), text: async () => "" }); });
+  const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify" };
+  const run = core.runUpdate(adapter, "HB", cfg);
+  assert.ok(core.isBusy("HB"), "busy from the start of the run, before Claude answers");
+  await assert.rejects(core.runUpdate(adapter, "HB", cfg), /already updating/, "a second run during the API call is refused");
+  while (!release) await new Promise((r) => setTimeout(r, 5));
+  release();
+  const r = await run;
+  assert.strictEqual(r.created, 1);
+  assert.ok(!core.isBusy("HB"), "not busy once the run is over");
+  console.log("busy tests OK");
+})().catch((e) => { console.error(e); process.exit(1); });
