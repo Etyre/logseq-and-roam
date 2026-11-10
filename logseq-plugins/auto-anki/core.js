@@ -22,7 +22,9 @@
  * prefixed "[auto-anki]". Every system prompt starts with the shared preamble and every call
  * carries the contact_eli tool (llm-contact.js, loaded before this file); when Claude uses
  * either, the run stops without touching the cards and the message is written to the graph
- * page "llm-inbox" and kept in localStorage ("llm-inbox:records").
+ * page "llm-inbox" and kept in localStorage ("llm-inbox:records"). A contact_eli call is first put
+ * to the model as one question (send, or it was a remark about the task: LlmContact.withConfirm);
+ * what it chooses not to send is kept in localStorage ("llm-inbox:unconfirmed").
  */
 (function (root) {
   const contact = () => { if (!root.LlmContact) throw new Error("llm-contact.js is not loaded (rebuild: auto-anki/build.sh)"); return root.LlmContact; };
@@ -517,42 +519,67 @@ MAINTENANCE
     };
   }
 
-  /** One call; the answer streams in and onText gets each piece of the model's text as it arrives. */
-  async function callClaude({ apiKey, model, effort, system, user, fetchImpl, onText }) {
+  /**
+   * One call; the answer streams in and onText gets each piece of the model's text as it arrives. A contact_eli
+   * call is first put to the model as one question (LlmContact.withConfirm): if it says the call was a remark
+   * about the task, the answer is asked for again (onRestart first, so the caller can drop what the first
+   * attempt streamed) and what it had said is kept as unconfirmed; otherwise the caller stops as before.
+   */
+  async function callClaude({ apiKey, model, effort, system, user, fetchImpl, onText, onRestart }) {
     const f = fetchImpl || root.fetch.bind(root);
-    const body = {
+    const C = contact();
+    const request = {
       model: model || "claude-opus-5",
-      max_tokens: 16000,
-      stream: true,
-      system: (Array.isArray(system) ? system : [system]).filter(Boolean).map((t) => ({ type: "text", text: t, cache_control: { type: "ephemeral" } })),
+      system: (Array.isArray(system) ? system : [system]).filter(Boolean),
       messages: [{ role: "user", content: user }],
-      tools: [contact().CONTACT_TOOL], // the preamble promises Claude a way to reach Eli
-      output_config: { effort: effort || "high", format: { type: "json_schema", schema: SCHEMA } },
-      fallbacks: "default",
+      tools: [C.CONTACT_TOOL], // the preamble promises Claude a way to reach Eli
     };
-    const headers = {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "server-side-fallback-2026-07-01",
-      "anthropic-dangerous-direct-browser-access": "true",
+    const send = async (messages, decide) => {
+      const body = {
+        model: request.model,
+        max_tokens: 16000,
+        stream: true,
+        system: request.system.map((t) => ({ type: "text", text: t, cache_control: { type: "ephemeral" } })),
+        messages,
+        tools: request.tools,
+        output_config: { effort: effort || "high", format: { type: "json_schema", schema: SCHEMA } },
+        fallbacks: "default",
+      };
+      // The confirm question (decide): same model, system and tools plus a forced choice. Short, so not streamed;
+      // no JSON output format, no effort and no thinking, because a forced tool cannot be combined with thinking.
+      if (decide) { Object.assign(body, C.decisionRequest(request.tools), { stream: false, thinking: { type: "disabled" } }); delete body.output_config; }
+      const headers = {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "server-side-fallback-2026-07-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      };
+      let res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+      if (res.status === 400) {
+        // older models / accounts: retry without structured output and fallbacks
+        const err = await res.text();
+        console.warn("[auto-anki] 400, retrying without output format:", err.slice(0, 300));
+        if (body.output_config) delete body.output_config.format;
+        delete body.fallbacks; delete headers["anthropic-beta"];
+        res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
+      }
+      if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
+      let data;
+      if (decide) data = await res.json();
+      else if (res.body && typeof res.body.getReader === "function") data = await readStream(res, onText);
+      else { data = await res.json(); if (onText) for (const b of data.content || []) if (b.type === "text" && b.text) onText(b.text); } // a plain JSON reply (tests)
+      if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
+      return data;
     };
-    let res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
-    if (res.status === 400) {
-      // older models / accounts: retry without structured output and fallbacks
-      const err = await res.text();
-      console.warn("[auto-anki] 400, retrying without output format:", err.slice(0, 300));
-      delete body.output_config.format; delete body.fallbacks; delete headers["anthropic-beta"];
-      res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) });
-    }
-    if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
-    let data;
-    if (res.body && typeof res.body.getReader === "function") data = await readStream(res, onText);
-    else { data = await res.json(); if (onText) for (const b of data.content || []) if (b.type === "text" && b.text) onText(b.text); } // a plain JSON reply (tests)
-    if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
-    const request = { model: body.model, system: body.system.map((b) => b.text), messages: body.messages, tools: body.tools };
+    const first = await send(request.messages, false);
+    const app = settings.app || "auto-anki";
+    // any error or unclear answer in the confirm step hands back `first` unchanged, so check() records it
+    const confirmed = await C.withConfirm({ app, model: request.model, messages: request.messages, response: first, call: async (m, decide) => { if (!decide && onRestart) await onRestart(); return send(m, decide); } });
+    const data = confirmed.response;
+    request.messages = confirmed.messages;
     // Claude asked for Eli (contact_eli call or an "@ELI:" line): no result, the caller stops
-    const rec = contact().check({ app: settings.app || "auto-anki", model: body.model, system: request.system, messages: request.messages, response: data, tools: request.tools });
+    const rec = C.check({ app, model: request.model, system: request.system, messages: request.messages, response: data, tools: request.tools });
     if (rec) return { contact: rec, usage: data.usage, model: data.model, request };
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
     return { result: parseJson(text), usage: data.usage, model: data.model, request };
@@ -733,10 +760,12 @@ MAINTENANCE
         }).catch((e) => { streamError = streamError || e; });
       };
       const rollback = async () => { for (const uid of [...live.created].reverse()) { try { await adapter.deleteBlock(uid); } catch (e) { console.error("[auto-anki] rollback", e); } } live.created = []; };
-      const scanner = jsonNoteScanner(onNote);
+      let scanner = jsonNoteScanner(onNote);
+      // "it was a task remark, keep working": the answer is streamed afresh, so what the first attempt wrote goes
+      const onRestart = async () => { await queue; await rollback(); live.notes.clear(); live.groups.clear(); live.made.clear(); claimed.clear(); scanner = jsonNoteScanner(onNote); };
       let call;
       try {
-        call = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl, onText: (t) => scanner.feed(t) });
+        call = await callClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, system: systemBlocks, user, fetchImpl: cfg.fetchImpl, onText: (t) => scanner.feed(t), onRestart });
         await queue;
         if (streamError) throw streamError;
       } catch (e) { await queue; await rollback(); throw e; }

@@ -308,6 +308,11 @@
     const r = await window.LlmContact.copyRecords();
     toast(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this browser", "info");
   } });
+  // contact_eli messages Claude said were task remarks (confirm step): never sent, kept so they can be audited (README)
+  api.ui.commandPalette.addCommand({ label: "Claude in Roam: copy unconfirmed LLM messages", callback: async () => {
+    const r = await window.LlmContact.copyUnconfirmed();
+    toast(r.count ? `${r.count} unconfirmed message(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No unconfirmed LLM messages in this browser", "info");
+  } });
   if (api.ui.blockContextMenu) api.ui.blockContextMenu.addCommand({ label: "Claude in Roam: ask here", callback: (ctx) => {
     const uid = ctx && ctx["block-uid"];
     if (!uid) return;

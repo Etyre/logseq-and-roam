@@ -257,6 +257,11 @@ function main() {
     const r = await globalThis.LlmContact.copyRecords();
     logseq.UI.showMsg(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this plugin", "info");
   });
+  // contact_eli messages Claude said were task remarks (confirm step): never sent, kept so they can be audited (README)
+  logseq.App.registerCommandPalette({ key: "claude-in-logseq-copy-unconfirmed", label: "Claude in Logseq: copy unconfirmed LLM messages" }, async () => {
+    const r = await globalThis.LlmContact.copyUnconfirmed();
+    logseq.UI.showMsg(r.count ? `${r.count} unconfirmed message(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No unconfirmed LLM messages in this plugin", "info");
+  });
 
   // [[cl:]] typed into a block (saved by Logseq as you type); a block that already has
   // children is an existing conversation, not a trigger

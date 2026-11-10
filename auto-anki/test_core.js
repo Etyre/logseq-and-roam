@@ -189,10 +189,19 @@ async function contactTests() {
     // a normal answer afterwards still works
     { content: [{ type: "text", text: JSON.stringify({ tags: [], notes: [{ uid: null, text: "r1 {c1:x}", back: [] }], groups: [], delete: [] }) }], usage: {}, stop_reason: "end_turn" },
   ];
-  const fetchImpl = async () => { const r = responses.shift(); return { ok: true, status: 200, json: async () => r, text: async () => "" }; };
+  // the confirm question (a request with tool_choice) is answered from `meant`: a value, or an Error to fail the call
+  const decisions = [], bodies = [];
+  let meant = "send_to_eli_and_stop";
+  const fetchImpl = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (body.tool_choice) { decisions.push(body); if (meant instanceof Error) throw meant; return { ok: true, status: 200, json: async () => ({ content: [{ type: "tool_use", id: "d1", name: "contact_eli_decision", input: { meant } }], stop_reason: "tool_use" }), text: async () => "" }; }
+    bodies.push(body);
+    const r = responses.shift(); return { ok: true, status: 200, json: async () => r, text: async () => "" };
+  };
   const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify" };
+  const quiet = async (fn) => { const { warn, error } = console; console.warn = console.error = () => {}; try { return await fn(); } finally { console.warn = warn; console.error = error; } };
   for (const via of ["tool", "marker"]) {
-    const r = await core.runUpdate(adapter, "H", cfg);
+    const r = await quiet(() => core.runUpdate(adapter, "H", cfg));
     assert.ok(r.contact && r.contact.via === via, "contact detected via " + via);
     assert.deepStrictEqual([r.created, r.updated, r.deleted], [0, 0, 0]);
     assert.deepStrictEqual(g.H.children, [], "no cards and no state block written when Claude asked for Eli");
@@ -208,8 +217,57 @@ async function contactTests() {
   assert.ok(recs[0].system[0].startsWith(LlmContact.PREAMBLE) && recs[0].messages.length === 1 && recs[0].response.content[0].name === "contact_eli", "record carries system, messages, response, tools");
   assert.deepStrictEqual(recs[0].tools, [LlmContact.CONTACT_TOOL]);
   assert.strictEqual(LlmContact.exportJsonl().split("\n").length, 2);
+  // the tool call was questioned once (same model and system, forced choice, no JSON format, no thinking); the @ELI: line never
+  assert.strictEqual(decisions.length, 1);
+  const dq = decisions[0];
+  assert.ok(dq.model === bodies[0].model && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
+  assert.deepStrictEqual(dq.system, bodies[0].system);
+  assert.deepStrictEqual(dq.thinking, { type: "disabled" });
+  assert.deepStrictEqual(dq.tool_choice, { type: "tool", name: "contact_eli_decision" });
+  assert.deepStrictEqual(dq.tools, [LlmContact.CONTACT_TOOL, LlmContact.CONFIRM.decision_tool]);
+  assert.deepStrictEqual(dq.messages.slice(1), [
+    { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "contact_eli", input: { message: "I would rather not write cards from this material." } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: LlmContact.CONFIRM.question }] },
+  ]);
   const r3 = await core.runUpdate(adapter, "H", cfg);
   assert.strictEqual(r3.created, 1); assert.ok(!r3.contact);
+  assert.strictEqual(decisions.length, 1, "no tool call, no question");
+
+  // confirm step, "it was a task remark, keep working": the cards are written, nothing is sent, the remark is kept apart
+  const remark = { type: "tool_use", id: "tu2", name: "contact_eli", input: { message: "The source has only one fact." } };
+  const cards = (texts) => ({ type: "text", text: JSON.stringify({ tags: [], notes: texts.map((t) => ({ uid: null, text: t, back: [] })), groups: [], delete: [] }) });
+  {
+    const { g: g5, adapter: ad5 } = fakeGraph();
+    ad5.appendToPage = adapter.appendToPage; ad5.notify = adapter.notify;
+    // the first attempt streamed a card before the call; the answer after the question replaces it
+    responses.push({ content: [cards(["first attempt {c1:x}"]), remark], usage: {}, stop_reason: "tool_use" }, { content: [cards(["k1 {c1:y}", "k2 {c1:z}"])], usage: {}, stop_reason: "end_turn" });
+    meant = "task_remark_keep_working";
+    const seen = notices.length, sent = bodies.length;
+    const r5 = await quiet(() => core.runUpdate(ad5, "H", cfg));
+    assert.ok(!r5.contact && r5.created === 2, JSON.stringify(r5));
+    const texts = g5.H.children.map((c) => g5[c].text);
+    assert.deepStrictEqual(texts.slice(0, 2), ["k1 {c1:y} #ankify", "k2 {c1:z} #ankify"]);
+    assert.ok(texts.length === 3 && core.isStateBlock(texts[2]) && !Object.values(g5).some((b) => /first attempt/.test(b.text)), "the first attempt's card is gone");
+    assert.strictEqual(bodies.length, sent + 2);
+    const cont = bodies[bodies.length - 1];
+    assert.ok(!cont.tool_choice && cont.stream === true && cont.output_config.format, "the continued call is an ordinary one");
+    assert.deepStrictEqual(cont.messages[2], { role: "user", content: [{ type: "tool_result", tool_use_id: "tu2", content: LlmContact.CONFIRM.keep_working }] });
+    assert.ok(LlmContact.records().length === 2 && inbox.length === g[pages["llm-inbox"]].children.length && notices.length === seen, "no contact, no inbox entry, no notice");
+    const unc = LlmContact.unconfirmed();
+    assert.ok(unc.length === 1 && unc[0].type === "unconfirmed" && unc[0].app === "auto-anki" && unc[0].message === "The source has only one fact.");
+  }
+  // confirm step broken (the question call throws): the original message is recorded all the same
+  {
+    const { g: g6, adapter: ad6 } = fakeGraph();
+    ad6.appendToPage = adapter.appendToPage; ad6.notify = adapter.notify;
+    responses.push({ content: [remark], usage: {}, stop_reason: "tool_use" });
+    meant = new Error("network down");
+    const r6 = await quiet(() => core.runUpdate(ad6, "H", cfg));
+    assert.ok(r6.contact && r6.contact.via === "tool" && r6.contact.message === "The source has only one fact.");
+    assert.deepStrictEqual(g6.H.children, []);
+    assert.ok(LlmContact.records().length === 3 && LlmContact.records()[2].messages.length === 1 && LlmContact.unconfirmed().length === 1);
+    assert.strictEqual(responses.length, 0);
+  }
   delete globalThis.localStorage;
   console.log("contact tests OK");
 }
@@ -457,8 +515,10 @@ function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
     const stored = {};
     globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
     const answer = { tags: [], notes: [note("a {c1:1}"), note("b {c1:2}")], groups: [], delete: [] };
-    const fetchImpl = async () => sseResponse({ content: [textBlock(answer), { type: "tool_use", id: "tu9", name: "contact_eli", input: { message: "please stop" } }], stop_reason: "tool_use" });
-    const r = await core.runUpdate(adapter, "HS", { apiKey: "k", fetchImpl, ankifyTag: "ankify" });
+    const send = { content: [{ type: "tool_use", id: "d1", name: "contact_eli_decision", input: { meant: "send_to_eli_and_stop" } }], stop_reason: "tool_use" }; // the answer to the confirm question
+    const fetchImpl = async (url, opts) => (JSON.parse(opts.body).tool_choice ? { ok: true, status: 200, json: async () => send, text: async () => "" } : sseResponse({ content: [textBlock(answer), { type: "tool_use", id: "tu9", name: "contact_eli", input: { message: "please stop" } }], stop_reason: "tool_use" }));
+    const warn = console.warn; console.warn = () => {};
+    const r = await core.runUpdate(adapter, "HS", { apiKey: "k", fetchImpl, ankifyTag: "ankify" }).finally(() => { console.warn = warn; });
     assert.ok(r.contact && r.contact.via === "tool");
     assert.deepStrictEqual(g.HS.children, [], "streamed cards rolled back when Claude asked for Eli");
     assert.strictEqual(g[pages["llm-inbox"]].children.length, 1);

@@ -298,6 +298,11 @@
     const r = await window.LlmContact.copyRecords();
     toast(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this browser", "info");
   } });
+  // contact_eli messages Claude said were task remarks (confirm step): never sent, kept so they can be audited (README)
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: copy unconfirmed LLM messages", callback: async () => {
+    const r = await window.LlmContact.copyUnconfirmed();
+    toast(r.count ? `${r.count} unconfirmed message(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No unconfirmed LLM messages in this browser", "info");
+  } });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: edit prompt", callback: async () => {
     try {
       const existing = await adapter.readPageTrees(CONFIG.promptPage);

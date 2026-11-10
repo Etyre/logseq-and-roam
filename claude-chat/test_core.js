@@ -202,10 +202,31 @@ function fakeGraph() {
   globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
   // via the tool, with no text at all
   replies.push([]);
-  const toolFetch = async (url, opts) => { requests.push({ body: JSON.parse(opts.body), headers: opts.headers }); return sse(replies.shift(), { message: "I would like to stop this thread." }); };
+  // Fake Claude for the confirm step: the forced question (a request with tool_choice) is answered with
+  // `meant` (or fails when meant is an Error); a normal request gets the next reply, the first one with the call.
+  const decisions = [];
+  const confirmFetch = (toolCall, meant) => { let asked = false; return async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (body.tool_choice) { decisions.push(body); if (meant instanceof Error) throw meant; return { ok: true, status: 200, json: async () => ({ content: [{ type: "tool_use", id: "d1", name: "contact_eli_decision", input: { meant } }], stop_reason: "tool_use" }), text: async () => "" }; }
+    requests.push({ body, headers: opts.headers });
+    const r = sse(replies.shift(), asked ? null : toolCall); asked = true; return r;
+  }; };
+  const quiet = async (fn) => { const { warn, error } = console; console.warn = console.error = () => {}; try { return await fn(); } finally { console.warn = warn; console.error = error; } };
+  const toolFetch = confirmFetch({ message: "I would like to stop this thread." }, "send_to_eli_and_stop");
   const f3 = await ad2.createBlock("T", "keep going");
   ad2.focused = null;
-  const r3 = await core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: toolFetch }), { uid: f3 });
+  const r3 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: toolFetch }), { uid: f3 }));
+  // the question was asked first: same model and system, the turn so far plus the question, a forced choice, no thinking
+  assert.strictEqual(decisions.length, 1);
+  const dq = decisions[0], asked = requests[requests.length - 1].body;
+  assert.ok(dq.model === asked.model && dq.system[0].text === asked.system[0].text && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
+  assert.deepStrictEqual(dq.thinking, { type: "disabled" });
+  assert.deepStrictEqual(dq.tool_choice, { type: "tool", name: "contact_eli_decision" });
+  assert.deepStrictEqual(dq.tools, asked.tools.concat([LlmContact.CONFIRM.decision_tool]));
+  assert.deepStrictEqual(dq.messages.slice(asked.messages.length), [
+    { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "contact_eli", input: { message: "I would like to stop this thread." } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: LlmContact.CONFIRM.question }] },
+  ]);
   assert.ok(r3.contact && r3.contact.via === "tool" && r3.contact.message === "I would like to stop this thread.", "tool call rebuilt from streamed input_json_delta pieces");
   assert.strictEqual(r3.stop, "tool_use");
   assert.ok(g2[f3].children.map((c) => g2[c].text).some((t) => /^\*\*Claude asked to reach Eli\*\* \(recorded on \[\[llm-inbox\]\].*I would like to stop this thread\.$/.test(t)), JSON.stringify(g2[f3].children.map((c) => g2[c].text)));
@@ -214,8 +235,9 @@ function fakeGraph() {
   // via an @ELI: line in the streamed text (the text is still written as the reply)
   replies.push(["- One point\n", "- @ELI: this page is", " about me, please read it first\n"]);
   const f4 = await ad2.createBlock("T", "and?");
-  const r4 = await core.followUp(ad2, cfg, { uid: f4 });
+  const r4 = await quiet(() => core.followUp(ad2, cfg, { uid: f4 }));
   assert.ok(r4.contact && r4.contact.via === "marker" && r4.contact.message === "this page is about me, please read it first");
+  assert.strictEqual(decisions.length, 1, "an @ELI: line is never questioned");
   assert.strictEqual(g2[f4].children.length, 3, "reply blocks plus the notice");
   const inbox = g2[pages["llm-inbox"]].children.map((c) => g2[c]);
   assert.strictEqual(inbox.length, 2);
@@ -225,6 +247,40 @@ function fakeGraph() {
   assert.strictEqual(recs.length, 2, "full records kept locally");
   assert.ok(recs[0].system.startsWith(LlmContact.PREAMBLE) && recs[0].messages[recs[0].messages.length - 1].content === "keep going" && recs[0].response.content[1].name === "contact_eli", "record carries system, messages, response, tools");
   assert.strictEqual(recs[0].tools.length, 2);
+
+  // ----- confirm step: "it was a task remark, keep working" -> the chat goes on, nothing is sent -----
+  replies.push(["- A remark\n- cut off mid-li"], ["- The real answer\n", "  - with detail"]);
+  const f5 = await ad2.createBlock("T", "anything on this page?");
+  const before5 = requests.length;
+  const r5 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "This page has no articles." }, "task_remark_keep_working") }), { uid: f5 }));
+  assert.ok(!r5.contact && r5.stop === "end_turn" && r5.text === "- The real answer\n  - with detail");
+  assert.deepStrictEqual(g2[f5].children.map((c) => g2[c].text), ["A remark", "cut off mid-li", "The real answer"], "the answer continues the same reply, on a new line");
+  assert.strictEqual(requests.length, before5 + 2, "one more normal call after the question");
+  const cont = requests[requests.length - 1].body;
+  assert.ok(!cont.tool_choice && cont.stream === true && cont.output_config.effort === "low", "the continued call is an ordinary one");
+  assert.deepStrictEqual(cont.messages.slice(-2), [
+    { role: "assistant", content: [{ type: "text", text: "- A remark\n- cut off mid-li" }, { type: "tool_use", id: "tu1", name: "contact_eli", input: { message: "This page has no articles." } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: LlmContact.CONFIRM.keep_working }] },
+  ]);
+  assert.strictEqual(LlmContact.records().length, 2, "no contact recorded");
+  assert.strictEqual(g2[pages["llm-inbox"]].children.length, 2, "nothing written to the inbox page");
+  const unc = LlmContact.unconfirmed();
+  assert.ok(unc.length === 1 && unc[0].type === "unconfirmed" && unc[0].message === "This page has no articles." && unc[0].app === "claude-in-roam", "what Claude chose not to send is kept apart");
+  assert.ok(!notices.some((n) => /no articles/.test(n.msg)), "and nobody is notified");
+  assert.deepStrictEqual(ad2.focused && ad2.focused.uid, r5.lastUid, "cursor moves on as after any reply");
+  // the next turn is built from the graph as usual
+  replies.push(["- Sure"]);
+  const f6 = await ad2.createBlock("T", "thanks");
+  const r6 = await core.followUp(ad2, cfg, { uid: f6 });
+  assert.ok(!r6.contact && requests[requests.length - 1].body.messages.every((m) => typeof m.content === "string"));
+
+  // ----- confirm step broken (the question call throws): the original message is recorded all the same -----
+  replies.push([]);
+  const f7 = await ad2.createBlock("T", "go on");
+  const r7 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "Please stop here." }, new Error("network down")) }), { uid: f7 }));
+  assert.ok(r7.contact && r7.contact.via === "tool" && r7.contact.message === "Please stop here.");
+  assert.ok(LlmContact.records().length === 3 && LlmContact.unconfirmed().length === 1);
+  assert.strictEqual(LlmContact.records()[2].messages[LlmContact.records()[2].messages.length - 1].content, "go on", "recorded with the original messages");
   delete globalThis.localStorage;
   console.log("contact tests OK");
   console.log("core tests OK");

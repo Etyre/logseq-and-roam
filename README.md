@@ -39,6 +39,20 @@ README with the detail; this file is the map and the operating manual.
   and shows a warning. "copy LLM inbox records" (command palette) copies those records as
   JSON lines for `shared/llm_contact.py report`, which puts them in the real inbox and
   notifies Eli (see Common tasks).
+- **Confirm step** (added 2026-11-10; `withConfirm` in `llm-contact/template.js`, a port of
+  `with_confirm` in `shared/llm_contact.py`): small models call `contact_eli` for routine remarks
+  about the task, so a `contact_eli` call is first followed by one forced-choice question
+  (`contact_eli_decision`: `send_to_eli_and_stop` or `task_remark_keep_working`), asked of the same
+  model with the same system prompt and tools, without thinking, effort or output format. Only an
+  explicit "keep working" continues: the model is asked for its answer again (Auto-anki drops any
+  cards the first attempt streamed and writes the new ones; the chat continues the same reply) and
+  what it had said is kept in localStorage `llm-inbox:unconfirmed`, with no notice and nothing on
+  the `llm-inbox` page. Send, an unclear answer, or any error in the question call: the original
+  response is recorded exactly as before. An `@ELI:` line is never questioned. The question and
+  the decision tool are baked in by `llm-contact/build.sh` from
+  `llm_contact.py confirm-constants`, never retyped. It only runs once the rebuilt `roam/*.js`
+  files are re-pasted into their `roam/js` blocks and the two Logseq plugins are reloaded
+  (Common tasks); until then the older copies keep sending every `contact_eli` call unasked.
 - **Small Logseq plugins** (`logseq-plugins/`): ten unpacked plugins that recreate Roam
   habits in Logseq (inline checkboxes, block ids, backwards embeds, random page, template
   tokens, …); `roam/` holds the Roam-side twins of two of them.
@@ -51,7 +65,7 @@ README with the detail; this file is the map and the operating manual.
 | `Claude-in-roam _ Claude-in-logseq.md` | Eli's original spec for the Claude-in-outliner feature. |
 | `claude-chat/` | "Claude in Roam / Logseq": `core.js` (triggers, prompt, streaming SSE reader, outline writer, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `README.md`. |
 | `auto-anki/` | "Auto-anki": `core.js` (state block, frozen notes, prompt, streamed structured-output call that writes each card as it arrives, planner, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `card-principles.md`, `README.md`. |
-| `llm-contact/` | `build.sh` generates `llm-contact.js` (preamble, `contact_eli` tool, `extract`/`check`, local record store) from `template.js` and the shared files. Both other build scripts call it. |
+| `llm-contact/` | `build.sh` generates `llm-contact.js` (preamble, `contact_eli` tool, `extract`/`check`, the confirm step, local record stores) from `template.js` and the shared files, then runs `test.js` (confirm step against stubbed model calls). Both other build scripts call it. |
 | `roam/` | Paste-in `roam/js` blocks: `claude-in-roam.js` and `auto-anki.js` (generated, do not edit), `backwards-embed.js`; `README.md` has the install steps. |
 | `logseq-plugins/` | One folder per unpacked Logseq plugin; `README.md` lists them. `claude-in-logseq/` and `auto-anki/` receive `core.js` and `llm-contact.js` from the build scripts. |
 | `ankify_logseq/` | Python package + tests; `README.md`, `DESIGN.md`, `CHANGELOG.md`. |
@@ -67,7 +81,7 @@ README with the detail; this file is the map and the operating manual.
 - **Logseq plugins**: loaded unpacked from this folder (Logseq remembers the path); per-plugin settings, including the Anthropic API key, in `~/.logseq/settings/<plugin-id>.json` (`logseq-claude-in-logseq`, `logseq-auto-anki`, …). Logs: Logseq developer console (`[claude-in-logseq]`, `[auto-anki]`, …).
 - **Roam**: the code lives in the graph as `{{[[roam/js]]}}` blocks (pasted by hand); the API key in the browser's localStorage (`claude-in-roam:apiKey`, `auto-anki:apiKey`). Logs: the browser console.
 - **In-graph pages written by the features**: `auto-anki/prompt`, `auto-anki/examples`, `llm-inbox`.
-- **LLM inbox records in the browser**: localStorage key `llm-inbox:records` (last 50). The shared inbox itself is `~/Library/Application Support/LLMInbox/messages.jsonl` (see `../shared/README.md`).
+- **LLM inbox records in the browser**: localStorage key `llm-inbox:records` (last 50); messages the model chose not to send in the confirm step: `llm-inbox:unconfirmed` (last 50, never notified). The shared inbox itself is `~/Library/Application Support/LLMInbox/messages.jsonl` (see `../shared/README.md`).
 - **Anki**: AnkiConnect on `localhost:8765`; the integration test uses the throwaway profile `ankify_test`. The daily Roam→Anki job `com.elityre.roam-anki-autoimport` is *not* from this folder (source: `~/Documents/Programming/Incremental_Reading_in_Roam/`), it only shares the Anki note types.
 - **Otter**: credentials `~/.otter-credentials`, state `~/.otter2logseq/state.json` (both outside the repo).
 
@@ -85,6 +99,7 @@ claude-chat/build.sh
 # Tests without any API key or running app
 node auto-anki/test_core.js          # fake graph + fake Claude, incl. a contact_eli call and an @ELI: line
 node claude-chat/test_core.js        # fake streaming Claude, incl. a streamed contact_eli call
+node llm-contact/test.js             # the confirm step alone: keep / send / unclear / failing question call
 cd ankify_logseq && /usr/bin/python3 -m unittest discover tests/unit && cd ..       # 46 tests, no Anki
 cd switching-from-roam-to-logseq && /usr/bin/python3 -m unittest discover tests && cd ..   # converter round trip
 cd ankify_logseq && /usr/bin/python3 -m unittest tests.integration.test_anki   # end to end in the Anki profile "ankify_test" (Anki open)
@@ -104,6 +119,9 @@ launchctl bootout gui/$(id -u)/com.elityre.logseq-backup     # stop
 # (command palette → "… copy LLM inbox records" copies JSON lines to the clipboard first)
 pbpaste | while IFS= read -r line; do printf '%s' "$line" | python3 ~/Documents/agent-coding/shared/llm_contact.py report; done
 llm-inbox list
+# audit what the confirm step did not send (command palette → "… copy unconfirmed LLM messages");
+# read it, or add it to the shared unconfirmed.jsonl:
+pbpaste | while IFS= read -r line; do printf '%s' "$line" | python3 ~/Documents/agent-coding/shared/llm_contact.py unconfirmed; done
 
 # Migration (Runbook A in switching-from-roam-to-logseq/README.md)
 cd switching-from-roam-to-logseq && python3 -m roam2logseq.convert EXPORT.json ~/Documents/<new-graph> --git
@@ -134,4 +152,7 @@ cd switching-from-roam-to-logseq && python3 -m roam2logseq.convert EXPORT.json ~
 - ankify_roam fills *every* field of a note on update; once `logseq uid` is populated, an unpatched ankify_roam run would blank it on all 7,000 notes. Patch it before Part II writes anything (DESIGN.md §2.3).
 - The Logseq plugin iframe has its own localStorage: Claude-in-Logseq and Auto-anki records may sit in different stores, so "copy LLM inbox records" exists in both plugins (and in both Roam scripts, which share the Roam origin).
 - Logseq OG 1.0.0: File → New Window is broken (`$isFocused$` mangling) and new windows re-persist the whole graph cache (~5 s, and a stale window can overwrite a newer page). `patches/logseq-og-new-window.sh --safe` fixes the first without the second.
+- `llm-contact/build.sh` needs python >= 3.10 for `llm_contact.py confirm-constants` (`/usr/bin/python3` is 3.9 and fails on its type hints); it tries `/opt/homebrew/bin/python3` first and stops with an error, leaving the old `llm-contact.js` in place, when none is found.
+- The confirm question forces a tool (`tool_choice`) and turns thinking off for that one call. A model or account that rejects either makes the question call fail, and a failed question call sends the original message, so on such a model every `contact_eli` call reaches Eli as it did before the confirm step. Not yet tried against the live API from the browser (2026-11-10): the first real `contact_eli` call will show which way `claude-opus-5` goes; look for "confirm step FAILED" in the console.
+- The stores for unconfirmed messages are per origin like the records: one for Roam, one per Logseq plugin. Read them now and then (the shared README explains why: a real request phrased as a question about the task can land there).
 - The shared helper `python3 shared/llm_contact.py check` exits 3 when a message was recorded; the browser-side `LlmContact.check()` returns the record instead. Both mean the same: stop the task, do not retry.

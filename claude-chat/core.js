@@ -18,7 +18,9 @@
  * errors are also written into the graph where the reply would have gone. Every system prompt
  * starts with the shared preamble and every call carries the contact_eli tool (llm-contact.js,
  * loaded before this file); when Claude uses either, the turn stops and the message is written to
- * the graph page "llm-inbox" and kept in localStorage ("llm-inbox:records").
+ * the graph page "llm-inbox" and kept in localStorage ("llm-inbox:records"). A contact_eli call
+ * is first put to the model as one question (send, or it was a remark about the task and keep
+ * working: LlmContact.withConfirm); what it chooses not to send is kept in "llm-inbox:unconfirmed".
  */
 (function (root) {
   const contact = () => { if (!root.LlmContact) throw new Error("llm-contact.js is not loaded (rebuild: claude-chat/build.sh)"); return root.LlmContact; };
@@ -154,7 +156,7 @@ FORMAT (strict, the reply is written into outliner blocks):
   }
 
   // ---------- Claude API (raw HTTP + SSE; runs in a browser tab / plugin iframe) ----------
-  async function streamClaude({ apiKey, model, effort, systemText, messages, webSearch, maxTokens, fetchImpl, onText, signal }) {
+  async function streamClaude({ apiKey, model, effort, systemText, messages, webSearch, maxTokens, fetchImpl, onText, signal, decide }) {
     const f = fetchImpl || root.fetch.bind(root);
     const body = {
       model: model || "claude-opus-5",
@@ -168,6 +170,10 @@ FORMAT (strict, the reply is written into outliner blocks):
     body.tools = [];
     if (webSearch) body.tools.push({ type: "web_search_20260209", name: "web_search", max_uses: 5 });
     body.tools.push(contact().CONTACT_TOOL); // the preamble promises Claude a way to reach Eli
+    const request = { model: body.model, system: systemText, messages, tools: body.tools };
+    // The confirm question (decide): same model, system and tools plus a forced choice. Short, so not
+    // streamed; no effort and no thinking, because a forced tool cannot be combined with thinking.
+    if (decide) { Object.assign(body, contact().decisionRequest(body.tools), { stream: false, thinking: { type: "disabled" } }); delete body.output_config; }
     const headers = {
       "content-type": "application/json",
       "x-api-key": apiKey,
@@ -183,8 +189,9 @@ FORMAT (strict, the reply is written into outliner blocks):
       res = await f("https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body), signal });
     }
     if (!res.ok) throw new Error(`Claude API ${res.status}: ${(await res.text()).slice(0, 400)}`);
+    if (decide) return res.json();
     const r = await readSse(res, onText);
-    r.request = { model: body.model, system: systemText, messages, tools: body.tools };
+    r.request = request;
     return r;
   }
 
@@ -390,7 +397,12 @@ FORMAT (strict, the reply is written into outliner blocks):
       if (adapter.onBusy) adapter.onBusy(convUid, true);
       // the shared preamble always comes first, then the project's own instructions
       const systemText = contact().systemPrompt(cfg.systemText || system(cfg));
-      const r = await streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText, messages, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t) });
+      const call = (m, decide) => streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText, messages: m, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t), decide });
+      const first = await call(messages, false);
+      // A contact_eli call is put to Claude as one question before anything is recorded. "Keep working":
+      // the answer streams into the same reply (after ending any half-written line). Anything else,
+      // errors included, hands back `first` unchanged and afterResponse records it.
+      const r = (await contact().withConfirm({ app: cfg.app || settings.app, model: first.request.model, messages, response: first, call: (m, decide) => { if (!decide) writer.push("\n"); return call(m, decide); } })).response;
       const w = await writer.finish();
       const rec = await afterResponse(adapter, cfg, r, replyUnder);
       // leave the cursor at the end of the reply (the adapter may decline, e.g. if the user is typing elsewhere)

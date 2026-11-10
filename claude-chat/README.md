@@ -12,12 +12,16 @@ get the reply streamed into nested blocks, then keep the thread going with Enter
   `../roam/claude-in-roam.js`.
 - `../logseq-plugins/claude-in-logseq/` — Logseq plugin; `build.sh` copies `core.js` there.
 - `test_core.js` — `node claude-chat/test_core.js` runs the core against a fake graph and a
-  fake streaming Claude (including a streamed `contact_eli` call and an `@ELI:` line).
+  fake streaming Claude (including a streamed `contact_eli` call, an `@ELI:` line, and the confirm
+  step: keep working, send, and a failing question call).
 - `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and `contact_eli` tool, baked in
   by `build.sh`; every system prompt starts with the preamble and every call offers the tool. When
   Claude uses either, the turn stops, the message goes to the graph page `llm-inbox` and the full
   record to localStorage ("Claude in Roam/Logseq: copy LLM inbox records" exports it; see the
-  top-level README).
+  top-level README). A `contact_eli` call is first put to Claude as one question (confirm step,
+  top-level README): if it answers that it was a remark about the task, its answer streams into the
+  same reply and the remark is kept in localStorage `llm-inbox:unconfirmed` ("Claude in Roam/Logseq:
+  copy unconfirmed LLM messages"); anything else stops the turn as described.
 
 Edit `core.js` / `roam-adapter.js`, run `./build.sh`, then re-paste the Roam file and
 reload the Logseq plugin.
