@@ -25,6 +25,8 @@ const fs = require("fs");
 const [preamblePath, toolPath, confirmJson] = process.argv.slice(2);
 const confirm = JSON.parse(confirmJson);
 for (const k of ["question", "keep_working", "decision_tool", "send_value", "keep_value"]) if (!confirm[k]) throw new Error("confirm-constants has no " + k);
+// an empty list is valid (the step is then off for every model); a missing one means an old llm_contact.py
+if (!Array.isArray(confirm.confirm_models) || confirm.confirm_models.some((m) => typeof m !== "string" || !m)) throw new Error("confirm-constants has no confirm_models list (update shared/llm_contact.py)");
 const preamble = fs.readFileSync(preamblePath, "utf8").trim();
 const tool = JSON.parse(fs.readFileSync(toolPath, "utf8"));
 if (confirm.contact_tool_name !== tool.name) throw new Error("llm_contact.py and contact_eli_tool.json disagree on the tool name");

@@ -18,8 +18,9 @@ get the reply streamed into nested blocks, then keep the thread going with Enter
   by `build.sh`; every system prompt starts with the preamble and every call offers the tool. When
   Claude uses either, the turn stops, the message goes to the graph page `llm-inbox` and the full
   record to localStorage ("Claude in Roam/Logseq: copy LLM inbox records" exports it; see the
-  top-level README). A `contact_eli` call is first put to Claude as one question (confirm step,
-  top-level README): if it answers that it was a remark about the task, its answer streams into the
+  top-level README). For a model on the shared confirm list (today only `claude-haiku-4-5`; not
+  the default `claude-opus-5`, whose calls are sent unasked) a `contact_eli` call is first put to
+  Claude as one question (confirm step, top-level README): if it answers that it was a remark about the task, its answer streams into the
   same reply and the remark is kept in localStorage `llm-inbox:unconfirmed` ("Claude in Roam/Logseq:
   copy unconfirmed LLM messages"); anything else stops the turn as described.
 

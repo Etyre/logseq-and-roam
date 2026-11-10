@@ -213,13 +213,14 @@ function fakeGraph() {
   }; };
   const quiet = async (fn) => { const { warn, error } = console; console.warn = console.error = () => {}; try { return await fn(); } finally { console.warn = warn; console.error = error; } };
   const toolFetch = confirmFetch({ message: "I would like to stop this thread." }, "send_to_eli_and_stop");
+  const haiku = Object.assign({}, cfg, { model: "claude-haiku-4-5" }); // the question is only asked of models in CONFIRM.confirm_models
   const f3 = await ad2.createBlock("T", "keep going");
   ad2.focused = null;
-  const r3 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: toolFetch }), { uid: f3 }));
+  const r3 = await quiet(() => core.followUp(ad2, Object.assign({}, haiku, { fetchImpl: toolFetch }), { uid: f3 }));
   // the question was asked first: same model and system, the turn so far plus the question, a forced choice, no thinking
   assert.strictEqual(decisions.length, 1);
   const dq = decisions[0], asked = requests[requests.length - 1].body;
-  assert.ok(dq.model === asked.model && dq.system[0].text === asked.system[0].text && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
+  assert.ok(dq.model === "claude-haiku-4-5" && dq.model === asked.model && dq.system[0].text === asked.system[0].text && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
   assert.deepStrictEqual(dq.thinking, { type: "disabled" });
   assert.deepStrictEqual(dq.tool_choice, { type: "tool", name: "contact_eli_decision" });
   assert.deepStrictEqual(dq.tools, asked.tools.concat([LlmContact.CONFIRM.decision_tool]));
@@ -241,7 +242,7 @@ function fakeGraph() {
   assert.strictEqual(g2[f4].children.length, 3, "reply blocks plus the notice");
   const inbox = g2[pages["llm-inbox"]].children.map((c) => g2[c]);
   assert.strictEqual(inbox.length, 2);
-  assert.ok(/^LLM inbox · .* · claude-in-roam · claude-opus-5 · via tool$/.test(inbox[0].text), inbox[0].text);
+  assert.ok(/^LLM inbox · .* · claude-in-roam · claude-haiku-4-5 · via tool$/.test(inbox[0].text), inbox[0].text);
   assert.strictEqual(g2[inbox[0].children[0]].text, "I would like to stop this thread.");
   const recs = LlmContact.records();
   assert.strictEqual(recs.length, 2, "full records kept locally");
@@ -252,7 +253,7 @@ function fakeGraph() {
   replies.push(["- A remark\n- cut off mid-li"], ["- The real answer\n", "  - with detail"]);
   const f5 = await ad2.createBlock("T", "anything on this page?");
   const before5 = requests.length;
-  const r5 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "This page has no articles." }, "task_remark_keep_working") }), { uid: f5 }));
+  const r5 = await quiet(() => core.followUp(ad2, Object.assign({}, haiku, { fetchImpl: confirmFetch({ message: "This page has no articles." }, "task_remark_keep_working") }), { uid: f5 }));
   assert.ok(!r5.contact && r5.stop === "end_turn" && r5.text === "- The real answer\n  - with detail");
   assert.deepStrictEqual(g2[f5].children.map((c) => g2[c].text), ["A remark", "cut off mid-li", "The real answer"], "the answer continues the same reply, on a new line");
   assert.strictEqual(requests.length, before5 + 2, "one more normal call after the question");
@@ -277,10 +278,19 @@ function fakeGraph() {
   // ----- confirm step broken (the question call throws): the original message is recorded all the same -----
   replies.push([]);
   const f7 = await ad2.createBlock("T", "go on");
-  const r7 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "Please stop here." }, new Error("network down")) }), { uid: f7 }));
+  const r7 = await quiet(() => core.followUp(ad2, Object.assign({}, haiku, { fetchImpl: confirmFetch({ message: "Please stop here." }, new Error("network down")) }), { uid: f7 }));
   assert.ok(r7.contact && r7.contact.via === "tool" && r7.contact.message === "Please stop here.");
   assert.ok(LlmContact.records().length === 3 && LlmContact.unconfirmed().length === 1);
   assert.strictEqual(LlmContact.records()[2].messages[LlmContact.records()[2].messages.length - 1].content, "go on", "recorded with the original messages");
+
+  // ----- a model the confirm step is not validated for (the default, claude-opus-5): recorded at once, no question -----
+  replies.push([]);
+  const f8 = await ad2.createBlock("T", "more?");
+  const asked8 = decisions.length;
+  const r8 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "Just a remark, perhaps." }, "task_remark_keep_working") }), { uid: f8 }));
+  assert.ok(r8.contact && r8.contact.via === "tool" && r8.contact.model === "claude-opus-5" && r8.contact.message === "Just a remark, perhaps.");
+  assert.strictEqual(decisions.length, asked8, "no question asked");
+  assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
   delete globalThis.localStorage;
   console.log("contact tests OK");
   console.log("core tests OK");

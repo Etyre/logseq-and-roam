@@ -12,7 +12,8 @@
 //   python3 ~/Documents/agent-coding/shared/llm_contact.py report
 //
 // Confirm step (mirrors llm_contact.with_confirm): small models call contact_eli for routine
-// remarks about the task, so before check() the cores run withConfirm(), which asks the model one
+// remarks about the task, so before check() the cores run withConfirm(), which asks the model (only
+// one listed in CONFIRM.confirm_models; any other model's call is sent unasked) one
 // forced-choice question: send to Eli and stop, or it was a task remark and keep working. Sending
 // is the default: any error or unclear answer hands back the original response, so a broken
 // confirm step never loses a message. What a model chose not to send is kept apart from the
@@ -20,7 +21,7 @@
 (function (root) {
   const PREAMBLE = __PREAMBLE__;
   const CONTACT_TOOL = __CONTACT_TOOL__;
-  // question, keep_working, decision_tool, send_value, keep_value: the wording lives in shared/llm_contact.py only
+  // question, keep_working, decision_tool, send_value, keep_value, confirm_models: all defined in shared/llm_contact.py only
   const CONFIRM = __CONFIRM__;
   const MARKER = "@ELI:";
   const STORAGE_KEY = "llm-inbox:records";
@@ -107,15 +108,22 @@
   }
 
   /**
+   * Is the question asked of this model? Only where it was measured to be safe (llm_contact.CONFIRM_MODELS, a
+   * list of model-name prefixes; mirrors llm_contact.confirm_applies): other models dropped real "I want to stop" messages when asked, or reject a
+   * forced tool. For every other model a contact_eli call is sent unasked.
+   */
+  const confirmApplies = (model) => typeof model === "string" && CONFIRM.confirm_models.some((m) => model.startsWith(m));
+
+  /**
    * Run the confirm step on a response. `call(messages, decide)` makes the app's model call on a longer message
    * list: decide=false exactly as the original call, decide=true with decisionRequest(). Resolves to
    * { messages, response } for check(): the originals when the model did not call contact_eli, chose to send, or
-   * anything at all went wrong; the continued exchange and its new answer when it chose to keep working.
+   * anything at all went wrong, and always for a model confirmApplies() does not list; the continued exchange and its new answer when it chose to keep working.
    */
   async function withConfirm({ app, model, messages, response, call }) {
     let kept, second;
     try {
-      const ask = confirmTurn(response);
+      const ask = confirmApplies(model) ? confirmTurn(response) : null;
       if (!ask) return { messages, response };
       if (!decidedKeep(await call(messages.concat(ask), true))) return { messages, response };
       kept = messages.concat(confirmTurn(response, CONFIRM.keep_working));
@@ -187,6 +195,6 @@
 
   root.LlmContact = {
     PREAMBLE, CONTACT_TOOL, CONFIRM, MARKER, STORAGE_KEY, UNCONFIRMED_KEY, INBOX_PAGE, systemPrompt, extract, check, records, exportJsonl, pageBlocks, copyRecords,
-    confirmTurn, decisionRequest, decidedKeep, withConfirm, noteUnconfirmed, unconfirmed, copyUnconfirmed,
+    confirmTurn, decisionRequest, decidedKeep, confirmApplies, withConfirm, noteUnconfirmed, unconfirmed, copyUnconfirmed,
   };
 })(typeof window !== "undefined" ? window : globalThis);

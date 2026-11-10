@@ -41,18 +41,23 @@ README with the detail; this file is the map and the operating manual.
   notifies Eli (see Common tasks).
 - **Confirm step** (added 2026-11-10; `withConfirm` in `llm-contact/template.js`, a port of
   `with_confirm` in `shared/llm_contact.py`): small models call `contact_eli` for routine remarks
-  about the task, so a `contact_eli` call is first followed by one forced-choice question
+  about the task, so for a model in the shared `CONFIRM_MODELS` list (prefixes baked in as
+  `CONFIRM.confirm_models`; today only `claude-haiku-4-5`) a `contact_eli` call is first followed
+  by one forced-choice question
   (`contact_eli_decision`: `send_to_eli_and_stop` or `task_remark_keep_working`), asked of the same
   model with the same system prompt and tools, without thinking, effort or output format. Only an
   explicit "keep working" continues: the model is asked for its answer again (Auto-anki drops any
   cards the first attempt streamed and writes the new ones; the chat continues the same reply) and
   what it had said is kept in localStorage `llm-inbox:unconfirmed`, with no notice and nothing on
   the `llm-inbox` page. Send, an unclear answer, or any error in the question call: the original
-  response is recorded exactly as before. An `@ELI:` line is never questioned. The question and
+  response is recorded exactly as before. An `@ELI:` line is never questioned. For every model not
+  on that list no question is asked and a `contact_eli` call is sent as before. Both features default
+  to `claude-opus-5` (Roam: `CONFIG.model`; Logseq: the plugin's Model setting), so here the confirm
+  step is inactive unless the model is set to Haiku 4.5. The question and
   the decision tool are baked in by `llm-contact/build.sh` from
-  `llm_contact.py confirm-constants`, never retyped. It only runs once the rebuilt `roam/*.js`
+  `llm_contact.py confirm-constants`, never retyped; so is the model list. It only runs once the rebuilt `roam/*.js`
   files are re-pasted into their `roam/js` blocks and the two Logseq plugins are reloaded
-  (Common tasks); until then the older copies keep sending every `contact_eli` call unasked.
+  (Common tasks); the same goes for a change to the shared model list.
 - **Small Logseq plugins** (`logseq-plugins/`): ten unpacked plugins that recreate Roam
   habits in Logseq (inline checkboxes, block ids, backwards embeds, random page, template
   tokens, …); `roam/` holds the Roam-side twins of two of them.
@@ -153,6 +158,7 @@ cd switching-from-roam-to-logseq && python3 -m roam2logseq.convert EXPORT.json ~
 - The Logseq plugin iframe has its own localStorage: Claude-in-Logseq and Auto-anki records may sit in different stores, so "copy LLM inbox records" exists in both plugins (and in both Roam scripts, which share the Roam origin).
 - Logseq OG 1.0.0: File → New Window is broken (`$isFocused$` mangling) and new windows re-persist the whole graph cache (~5 s, and a stale window can overwrite a newer page). `patches/logseq-og-new-window.sh --safe` fixes the first without the second.
 - `llm-contact/build.sh` needs python >= 3.10 for `llm_contact.py confirm-constants` (`/usr/bin/python3` is 3.9 and fails on its type hints); it tries `/opt/homebrew/bin/python3` first and stops with an error, leaving the old `llm-contact.js` in place, when none is found.
-- The confirm question forces a tool (`tool_choice`) and turns thinking off for that one call. A model or account that rejects either makes the question call fail, and a failed question call sends the original message, so on such a model every `contact_eli` call reaches Eli as it did before the confirm step. Not yet tried against the live API from the browser (2026-11-10): the first real `contact_eli` call will show which way `claude-opus-5` goes; look for "confirm step FAILED" in the console.
+- The confirm step is limited to models it was measured on and passed (`CONFIRM_MODELS` in `shared/llm_contact.py`; see the shared README's Gotchas for the numbers): Haiku 5.5 and Opus 5 dropped real "I want to stop" messages when asked, Sonnet 5 dropped some, and Sonnet 5.5 / Opus 5.5 / Fable 5.2 reject a forced `tool_choice`. To change the list, edit it there and rebuild here. With the default `claude-opus-5` nothing is ever questioned.
+- The question call forces a tool and turns thinking off for that one call; if the API rejects it, the call fails and the original message is sent (console: "confirm step FAILED"). The browser-side question call has not been tried against the live API (2026-11-10), and neither has running these two features on `claude-haiku-4-5` at all: they send `output_config.effort` and (chat) the `web_search_20260209` tool, which that model may not accept.
 - The stores for unconfirmed messages are per origin like the records: one for Roam, one per Logseq plugin. Read them now and then (the shared README explains why: a real request phrased as a question about the task can land there).
 - The shared helper `python3 shared/llm_contact.py check` exits 3 when a message was recorded; the browser-side `LlmContact.check()` returns the record instead. Both mean the same: stop the task, do not retry.

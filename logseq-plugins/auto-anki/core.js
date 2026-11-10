@@ -521,7 +521,8 @@ MAINTENANCE
 
   /**
    * One call; the answer streams in and onText gets each piece of the model's text as it arrives. A contact_eli
-   * call is first put to the model as one question (LlmContact.withConfirm): if it says the call was a remark
+   * call is first put to the model as one question (LlmContact.withConfirm; only models it lists, else the call
+   * is sent unasked): if it says the call was a remark
    * about the task, the answer is asked for again (onRestart first, so the caller can drop what the first
    * attempt streamed) and what it had said is kept as unconfirmed; otherwise the caller stops as before.
    */

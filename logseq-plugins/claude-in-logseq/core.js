@@ -399,7 +399,8 @@ FORMAT (strict, the reply is written into outliner blocks):
       const systemText = contact().systemPrompt(cfg.systemText || system(cfg));
       const call = (m, decide) => streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText, messages: m, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t), decide });
       const first = await call(messages, false);
-      // A contact_eli call is put to Claude as one question before anything is recorded. "Keep working":
+      // A contact_eli call is put to Claude as one question before anything is recorded (only for the
+      // models LlmContact.confirmApplies lists; otherwise `first` comes straight back). "Keep working":
       // the answer streams into the same reply (after ending any half-written line). Anything else,
       // errors included, hands back `first` unchanged and afterResponse records it.
       const r = (await contact().withConfirm({ app: cfg.app || settings.app, model: first.request.model, messages, response: first, call: (m, decide) => { if (!decide) writer.push("\n"); return call(m, decide); } })).response;

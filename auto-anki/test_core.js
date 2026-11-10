@@ -198,7 +198,7 @@ async function contactTests() {
     bodies.push(body);
     const r = responses.shift(); return { ok: true, status: 200, json: async () => r, text: async () => "" };
   };
-  const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify" };
+  const cfg = { apiKey: "k", fetchImpl, ankifyTag: "ankify", model: "claude-haiku-4-5" }; // the question is only asked of models in CONFIRM.confirm_models
   const quiet = async (fn) => { const { warn, error } = console; console.warn = console.error = () => {}; try { return await fn(); } finally { console.warn = warn; console.error = error; } };
   for (const via of ["tool", "marker"]) {
     const r = await quiet(() => core.runUpdate(adapter, "H", cfg));
@@ -209,7 +209,7 @@ async function contactTests() {
   }
   const inbox = g[pages["llm-inbox"]].children.map((c) => g[c]);
   assert.strictEqual(inbox.length, 2, "one inbox entry per contact");
-  assert.ok(/^LLM inbox · \d{4}-\d{2}-\d{2} \d{2}:\d{2} · auto-anki · claude-opus-5 · via tool$/.test(inbox[0].text), inbox[0].text);
+  assert.ok(/^LLM inbox · \d{4}-\d{2}-\d{2} \d{2}:\d{2} · auto-anki · claude-haiku-4-5 · via tool$/.test(inbox[0].text), inbox[0].text);
   assert.strictEqual(g[inbox[0].children[0]].text, "I would rather not write cards from this material.");
   assert.strictEqual(g[inbox[1].children[0]].text, "can we talk about this page?\nIt reads like a journal entry.");
   const recs = LlmContact.records();
@@ -220,7 +220,7 @@ async function contactTests() {
   // the tool call was questioned once (same model and system, forced choice, no JSON format, no thinking); the @ELI: line never
   assert.strictEqual(decisions.length, 1);
   const dq = decisions[0];
-  assert.ok(dq.model === bodies[0].model && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
+  assert.ok(dq.model === "claude-haiku-4-5" && dq.model === bodies[0].model && dq.stream === false && dq.max_tokens === 300 && !dq.output_config);
   assert.deepStrictEqual(dq.system, bodies[0].system);
   assert.deepStrictEqual(dq.thinking, { type: "disabled" });
   assert.deepStrictEqual(dq.tool_choice, { type: "tool", name: "contact_eli_decision" });
@@ -267,6 +267,19 @@ async function contactTests() {
     assert.deepStrictEqual(g6.H.children, []);
     assert.ok(LlmContact.records().length === 3 && LlmContact.records()[2].messages.length === 1 && LlmContact.unconfirmed().length === 1);
     assert.strictEqual(responses.length, 0);
+  }
+  // a model the confirm step is not validated for (the default, claude-opus-5): recorded at once, no question
+  {
+    const { g: g7, adapter: ad7 } = fakeGraph();
+    ad7.appendToPage = adapter.appendToPage; ad7.notify = adapter.notify;
+    responses.push({ content: [remark], usage: {}, stop_reason: "tool_use" });
+    meant = "task_remark_keep_working";
+    const asked = decisions.length;
+    const r7 = await quiet(() => core.runUpdate(ad7, "H", { ...cfg, model: undefined }));
+    assert.ok(r7.contact && r7.contact.via === "tool" && r7.contact.model === "claude-opus-5" && r7.contact.message === "The source has only one fact.");
+    assert.strictEqual(decisions.length, asked, "no question asked");
+    assert.deepStrictEqual(g7.H.children, []);
+    assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
   }
   delete globalThis.localStorage;
   console.log("contact tests OK");
@@ -515,8 +528,8 @@ function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
     const stored = {};
     globalThis.localStorage = { getItem: (k) => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = v; }, removeItem: (k) => { delete stored[k]; } };
     const answer = { tags: [], notes: [note("a {c1:1}"), note("b {c1:2}")], groups: [], delete: [] };
-    const send = { content: [{ type: "tool_use", id: "d1", name: "contact_eli_decision", input: { meant: "send_to_eli_and_stop" } }], stop_reason: "tool_use" }; // the answer to the confirm question
-    const fetchImpl = async (url, opts) => (JSON.parse(opts.body).tool_choice ? { ok: true, status: 200, json: async () => send, text: async () => "" } : sseResponse({ content: [textBlock(answer), { type: "tool_use", id: "tu9", name: "contact_eli", input: { message: "please stop" } }], stop_reason: "tool_use" }));
+    // the default model is not one the confirm step asks, so no request may carry the forced question
+    const fetchImpl = async (url, opts) => { assert.ok(!JSON.parse(opts.body).tool_choice); return sseResponse({ content: [textBlock(answer), { type: "tool_use", id: "tu9", name: "contact_eli", input: { message: "please stop" } }], stop_reason: "tool_use" }); };
     const warn = console.warn; console.warn = () => {};
     const r = await core.runUpdate(adapter, "HS", { apiKey: "k", fetchImpl, ankifyTag: "ankify" }).finally(() => { console.warn = warn; });
     assert.ok(r.contact && r.contact.via === "tool");

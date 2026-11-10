@@ -11,7 +11,8 @@ const tool = (message, id = "tu1") => ({ type: "tool_use", id, name: C.CONTACT_T
 const decision = (meant) => ({ content: [{ type: "tool_use", id: "d1", name: C.CONFIRM.decision_tool.name, input: { meant } }] });
 const answer = { content: [{ type: "text", text: "the answer" }] };
 const remark = { content: [{ type: "text", text: "" }, tool("this page has no articles"), { type: "tool_use", id: "tu2", name: "other_tool", input: { q: 1 } }] };
-const run = quiet((response, call) => C.withConfirm({ app: "test", model: "m", messages, response, call }));
+const ASKED = "claude-haiku-4-5"; // a model the confirm step is validated for
+const run = quiet((response, call, model = ASKED) => C.withConfirm({ app: "test", model, messages, response, call }));
 
 (async () => {
   // the request for the question: the app's tools plus the decision tool, forced
@@ -26,6 +27,17 @@ const run = quiet((response, call) => C.withConfirm({ app: "test", model: "m", m
     const r = await run(response, () => { throw new Error("must not be called"); });
     assert.ok(r.response === response && r.messages === messages);
   }
+
+  // a model the step is not validated for (or no model name at all): a contact_eli call is never questioned
+  assert.deepStrictEqual(C.CONFIRM.confirm_models, ["claude-haiku-4-5"], "update this test when shared CONFIRM_MODELS changes");
+  assert.ok(C.confirmApplies(ASKED) && C.confirmApplies(ASKED + "-20251001") && !C.confirmApplies("claude-haiku-5-5") && !C.confirmApplies("claude-opus-5") && !C.confirmApplies(undefined));
+  for (const model of ["claude-opus-5", "claude-haiku-5-5", null]) {
+    const r = await run(remark, () => { throw new Error("must not be called"); }, model);
+    assert.ok(r.response === remark && r.messages === messages);
+  }
+  assert.strictEqual(C.check({ app: "test", model: "claude-opus-5", messages, response: remark }).message, "this page has no articles");
+  assert.ok(C.records().length === 1 && C.unconfirmed().length === 0);
+  delete stored[C.STORAGE_KEY];
 
   // the ask turn: empty text dropped, the question on the contact_eli call, a placeholder on every other call
   const ask = C.confirmTurn(remark);
