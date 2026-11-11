@@ -7,6 +7,9 @@ get the reply streamed into nested blocks, then keep the thread going with Enter
   the context/conversation → messages builder, the streaming Claude call (raw HTTP, SSE,
   web search tool, effort), and the outline writer that turns streamed markdown bullets
   into blocks as the lines arrive (nesting by indentation, code fences kept in one block).
+  The system prompt (`system` in `core.js`) tells Claude to answer only what was asked: no
+  unrequested advice, next steps or offers of help (added 2026-11-11 after replies came with
+  unsolicited suggestions).
 - `roam-adapter.js` — Roam side (roamAlphaAPI reads/writes, typing triggers, Enter for
   follow-ups, command palette, styling). `build.sh` concatenates core + adapter into
   `../roam/claude-in-roam.js`.
