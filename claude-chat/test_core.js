@@ -148,7 +148,7 @@ function fakeGraph() {
   assert.deepStrictEqual(ad2.focused, { uid: reply[1].uid, atEnd: true }, "cursor goes to the end of the last reply block");
   assert.strictEqual(r1.lastUid, reply[1].uid);
   const req = requests[0];
-  assert.strictEqual(req.body.model, "claude-opus-5"); assert.strictEqual(req.body.output_config.effort, "low"); assert.strictEqual(req.body.stream, true);
+  assert.strictEqual(req.body.model, "claude-opus-5-5"); assert.strictEqual(req.body.output_config.effort, "low"); assert.strictEqual(req.body.stream, true);
   assert.deepStrictEqual(req.body.tools, [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, LlmContact.CONTACT_TOOL], "web search plus contact_eli");
   assert.ok(req.body.system[0].text.startsWith(LlmContact.PREAMBLE + "\n\n"), "the shared preamble comes first, word for word");
   assert.strictEqual(req.body.fallbacks, "default"); assert.strictEqual(req.headers["anthropic-dangerous-direct-browser-access"], "true");
@@ -283,12 +283,12 @@ function fakeGraph() {
   assert.ok(LlmContact.records().length === 3 && LlmContact.unconfirmed().length === 1);
   assert.strictEqual(LlmContact.records()[2].messages[LlmContact.records()[2].messages.length - 1].content, "go on", "recorded with the original messages");
 
-  // ----- a model the confirm step is not validated for (the default, claude-opus-5): recorded at once, no question -----
+  // ----- a model the confirm step is not validated for (the default, claude-opus-5-5): recorded at once, no question -----
   replies.push([]);
   const f8 = await ad2.createBlock("T", "more?");
   const asked8 = decisions.length;
   const r8 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "Just a remark, perhaps." }, "task_remark_keep_working") }), { uid: f8 }));
-  assert.ok(r8.contact && r8.contact.via === "tool" && r8.contact.model === "claude-opus-5" && r8.contact.message === "Just a remark, perhaps.");
+  assert.ok(r8.contact && r8.contact.via === "tool" && r8.contact.model === "claude-opus-5-5" && r8.contact.message === "Just a remark, perhaps.");
   assert.strictEqual(decisions.length, asked8, "no question asked");
   assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
   delete globalThis.localStorage;

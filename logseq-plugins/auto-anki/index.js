@@ -17,7 +17,7 @@ const SETTINGS = [
   { key: "homeTags", type: "string", title: "Home tags", description: "Comma-separated page names whose tag marks a home block.", default: "auto-generate cards, LLM-generated cards" },
   { key: "offTags", type: "string", title: "Off tags", description: "Comma-separated page names; a home block carrying one of these tags is switched off. Home blocks inside a template definition (an ancestor with template::) are off automatically.", default: "auto-anki off" },
   { key: "ankifyTag", type: "string", title: "Ankify tag", description: "Added to every generated note.", default: "ankify" },
-  { key: "model", type: "string", title: "Model", description: "", default: "claude-opus-5" },
+  { key: "model", type: "string", title: "Model", description: "", default: "claude-opus-5-5" },
   { key: "effort", type: "enum", title: "Effort", enumChoices: ["low", "medium", "high", "xhigh", "max"], enumPicker: "select", description: "", default: "high" },
   { key: "extraInstructions", type: "string", title: "Extra instructions", description: "Free text sent with every request (deck, style, language…).", default: "" },
   { key: "groupThreshold", type: "number", title: "Group notes when more than", description: "With more notes than this, the notes are organised under labelled heading blocks (at most two levels deep).", default: 6 },

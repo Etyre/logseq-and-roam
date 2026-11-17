@@ -18,7 +18,7 @@
     offTags: ["auto-anki off"], // add one of these to a home block to switch it off
     templateTags: ["roam/templates", "SmartBlock"], // home blocks under one of these (a template definition) are off
     ankifyTag: "ankify",
-    model: "claude-opus-5",
+    model: "claude-opus-5-5",
     effort: "high", // low | medium | high | xhigh | max
     extraInstructions: "", // free text appended to every request, e.g. deck or style preferences
     // More than `threshold` notes -> the notes are organised under labelled heading blocks

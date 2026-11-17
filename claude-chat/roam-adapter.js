@@ -18,7 +18,7 @@
     triggerPages: ["claude in roam", "cl:"], // [[page]] references that start a conversation; the first is used for the header
     slashTriggers: ["/claude"],
     marker: "=>",
-    model: "claude-opus-5",
+    model: "claude-opus-5-5",
     effort: "low", // low | medium | high | xhigh | max
     webSearch: true,
     // What Claude sees besides the conversation itself:

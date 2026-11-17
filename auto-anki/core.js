@@ -530,7 +530,7 @@ MAINTENANCE
     const f = fetchImpl || root.fetch.bind(root);
     const C = contact();
     const request = {
-      model: model || "claude-opus-5",
+      model: model || "claude-opus-5-5",
       system: (Array.isArray(system) ? system : [system]).filter(Boolean),
       messages: [{ role: "user", content: user }],
       tools: [C.CONTACT_TOOL], // the preamble promises Claude a way to reach Eli

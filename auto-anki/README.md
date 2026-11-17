@@ -17,7 +17,7 @@ Shared implementation of the "Auto-anki blocks" feature for Roam and Logseq.
   call. When Claude uses either channel the run stops without touching the cards, the message goes
   to the graph page `llm-inbox` and the full record to localStorage ("Auto-anki: copy LLM inbox
   records" exports it; see the top-level README). For a model on the shared confirm list (today only
-  `claude-haiku-4-5`; not the default `claude-opus-5`, whose calls are sent unasked) a `contact_eli`
+  `claude-haiku-4-5`; not the default `claude-opus-5-5`, whose calls are sent unasked) a `contact_eli`
   call is first put to the model as one question (confirm step, top-level README): if it answers that it was a remark about the task,
   the cards its first attempt streamed are removed, it is asked for the JSON answer again, and the
   remark is kept in localStorage `llm-inbox:unconfirmed` ("Auto-anki: copy unconfirmed LLM

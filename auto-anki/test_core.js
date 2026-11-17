@@ -268,7 +268,7 @@ async function contactTests() {
     assert.ok(LlmContact.records().length === 3 && LlmContact.records()[2].messages.length === 1 && LlmContact.unconfirmed().length === 1);
     assert.strictEqual(responses.length, 0);
   }
-  // a model the confirm step is not validated for (the default, claude-opus-5): recorded at once, no question
+  // a model the confirm step is not validated for (the default, claude-opus-5-5): recorded at once, no question
   {
     const { g: g7, adapter: ad7 } = fakeGraph();
     ad7.appendToPage = adapter.appendToPage; ad7.notify = adapter.notify;
@@ -276,7 +276,7 @@ async function contactTests() {
     meant = "task_remark_keep_working";
     const asked = decisions.length;
     const r7 = await quiet(() => core.runUpdate(ad7, "H", { ...cfg, model: undefined }));
-    assert.ok(r7.contact && r7.contact.via === "tool" && r7.contact.model === "claude-opus-5" && r7.contact.message === "The source has only one fact.");
+    assert.ok(r7.contact && r7.contact.via === "tool" && r7.contact.model === "claude-opus-5-5" && r7.contact.message === "The source has only one fact.");
     assert.strictEqual(decisions.length, asked, "no question asked");
     assert.deepStrictEqual(g7.H.children, []);
     assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
@@ -435,7 +435,7 @@ async function groupingTests() {
 
 /** A fake streamed Messages API response: text blocks arrive as text deltas, tool blocks as JSON deltas; onChunk runs before every network chunk. */
 function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
-  const events = [{ type: "message_start", message: { usage: { input_tokens: 1 }, model: "claude-opus-5" } }];
+  const events = [{ type: "message_start", message: { usage: { input_tokens: 1 }, model: "claude-opus-5-5" } }];
   content.forEach((b, index) => {
     if (b.type === "text") {
       events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });

@@ -22,7 +22,7 @@ get the reply streamed into nested blocks, then keep the thread going with Enter
   Claude uses either, the turn stops, the message goes to the graph page `llm-inbox` and the full
   record to localStorage ("Claude in Roam/Logseq: copy LLM inbox records" exports it; see the
   top-level README). For a model on the shared confirm list (today only `claude-haiku-4-5`; not
-  the default `claude-opus-5`, whose calls are sent unasked) a `contact_eli` call is first put to
+  the default `claude-opus-5-5`, whose calls are sent unasked) a `contact_eli` call is first put to
   Claude as one question (confirm step, top-level README): if it answers that it was a remark about the task, its answer streams into the
   same reply and the remark is kept in localStorage `llm-inbox:unconfirmed` ("Claude in Roam/Logseq:
   copy unconfirmed LLM messages"); anything else stops the turn as described.
@@ -53,5 +53,5 @@ reply yet stays editable, and so does the conversation block. When a reply has a
 cursor is placed at the end of it. The user's messages are bold; Claude's blocks are regular weight, though the model may bold a key term. Whatever the user wrote next to the trigger
 becomes the REQUEST; earlier turns of the thread are replayed from the blocks.
 
-Model `claude-opus-5`, effort `low`, server-side web search allowed, `fallbacks: "default"`.
+Model `claude-opus-5-5`, effort `low`, server-side web search allowed, `fallbacks: "default"`.
 The reply is requested as a markdown bullet outline (at most three levels).

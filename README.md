@@ -26,7 +26,7 @@ README with the detail; this file is the map and the operating manual.
   working on plain `{uid, text, children}` trees, plus an adapter per platform: a Roam
   `roam/js` paste-in (`roam/*.js`, built by concatenation) and an unpacked Logseq plugin
   (`logseq-plugins/*/`, the core is copied in). They call the Anthropic Messages API directly
-  from the browser (`fetch`, model `claude-opus-5`, server-side fallbacks); the API key is
+  from the browser (`fetch`, model `claude-opus-5-5`, server-side fallbacks); the API key is
   entered once per browser/plugin and never stored in the graph.
 - **LLM inbox** (`llm-contact/`): every system prompt starts with the shared preamble from
   `~/Documents/agent-coding/shared/llm-system-prompt-preamble.md` and every call offers the
@@ -52,7 +52,7 @@ README with the detail; this file is the map and the operating manual.
   the `llm-inbox` page. Send, an unclear answer, or any error in the question call: the original
   response is recorded exactly as before. An `@ELI:` line is never questioned. For every model not
   on that list no question is asked and a `contact_eli` call is sent as before. Both features default
-  to `claude-opus-5` (Roam: `CONFIG.model`; Logseq: the plugin's Model setting), so here the confirm
+  to `claude-opus-5-5` (Roam: `CONFIG.model`; Logseq: the plugin's Model setting), so here the confirm
   step is inactive unless the model is set to Haiku 4.5. The question and
   the decision tool are baked in by `llm-contact/build.sh` from
   `llm_contact.py confirm-constants`, never retyped; so is the model list. It only runs once the rebuilt `roam/*.js`
@@ -158,7 +158,7 @@ cd switching-from-roam-to-logseq && python3 -m roam2logseq.convert EXPORT.json ~
 - The Logseq plugin iframe has its own localStorage: Claude-in-Logseq and Auto-anki records may sit in different stores, so "copy LLM inbox records" exists in both plugins (and in both Roam scripts, which share the Roam origin).
 - Logseq OG 1.0.0: File → New Window is broken (`$isFocused$` mangling) and new windows re-persist the whole graph cache (~5 s, and a stale window can overwrite a newer page). `patches/logseq-og-new-window.sh --safe` fixes the first without the second.
 - `llm-contact/build.sh` needs python >= 3.10 for `llm_contact.py confirm-constants` (`/usr/bin/python3` is 3.9 and fails on its type hints); it tries `/opt/homebrew/bin/python3` first and stops with an error, leaving the old `llm-contact.js` in place, when none is found.
-- The confirm step is limited to models it was measured on and passed (`CONFIRM_MODELS` in `shared/llm_contact.py`; see the shared README's Gotchas for the numbers): Haiku 5.5 and Opus 5 dropped real "I want to stop" messages when asked, Sonnet 5 dropped some, and Sonnet 5.5 / Opus 5.5 / Fable 5.2 reject a forced `tool_choice`. To change the list, edit it there and rebuild here. With the default `claude-opus-5` nothing is ever questioned.
+- The confirm step is limited to models it was measured on and passed (`CONFIRM_MODELS` in `shared/llm_contact.py`; see the shared README's Gotchas for the numbers): Haiku 5.5 and Opus 5 dropped real "I want to stop" messages when asked, Sonnet 5 dropped some, and Sonnet 5.5 / Opus 5.5 / Fable 5.2 reject a forced `tool_choice`. To change the list, edit it there and rebuild here. With the default `claude-opus-5-5` nothing is ever questioned.
 - The question call forces a tool and turns thinking off for that one call; if the API rejects it, the call fails and the original message is sent (console: "confirm step FAILED"). The browser-side question call has not been tried against the live API (2026-11-10), and neither has running these two features on `claude-haiku-4-5` at all: they send `output_config.effort` and (chat) the `web_search_20260209` tool, which that model may not accept.
 - The stores for unconfirmed messages are per origin like the records: one for Roam, one per Logseq plugin. Read them now and then (the shared README explains why: a real request phrased as a question about the task can land there).
 - The shared helper `python3 shared/llm_contact.py check` exits 3 when a message was recorded; the browser-side `LlmContact.check()` returns the record instead. Both mean the same: stop the task, do not retry.

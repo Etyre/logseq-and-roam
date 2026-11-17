@@ -14,7 +14,7 @@
 const SETTINGS = [
   { key: "apiKey", type: "string", title: "Anthropic API key", description: "Stored in the plugin settings, not in the graph.", default: "" },
   { key: "triggerPage", type: "string", title: "Trigger pages", description: "Comma-separated. Referencing one of these pages in a block starts a conversation; the first heads every conversation block.", default: "claude in logseq, cl:" },
-  { key: "model", type: "string", title: "Model", description: "", default: "claude-opus-5" },
+  { key: "model", type: "string", title: "Model", description: "", default: "claude-opus-5-5" },
   { key: "effort", type: "enum", title: "Effort", enumChoices: ["low", "medium", "high", "xhigh", "max"], enumPicker: "select", description: "", default: "low" },
   { key: "webSearch", type: "boolean", title: "Allow web search", description: "", default: true },
   { key: "contextMode", type: "enum", title: "What Claude sees besides the conversation", enumChoices: ["parents", "parents+siblings", "page"], enumPicker: "select", description: "parents: the chain of parent blocks above the conversation. parents+siblings: also the other blocks under the closest parent. page: also every block on the page.", default: "parents" },

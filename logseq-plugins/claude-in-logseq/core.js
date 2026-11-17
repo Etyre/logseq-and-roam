@@ -161,7 +161,7 @@ FORMAT (strict, the reply is written into outliner blocks):
   async function streamClaude({ apiKey, model, effort, systemText, messages, webSearch, maxTokens, fetchImpl, onText, signal, decide }) {
     const f = fetchImpl || root.fetch.bind(root);
     const body = {
-      model: model || "claude-opus-5",
+      model: model || "claude-opus-5-5",
       max_tokens: maxTokens || 16000,
       stream: true,
       system: [{ type: "text", text: systemText, cache_control: { type: "ephemeral" } }],
