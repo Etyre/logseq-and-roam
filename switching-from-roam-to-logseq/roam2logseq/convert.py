@@ -252,7 +252,14 @@ def convert_buttons(string):
 
 
 # ---------------------------------------------------------------- SmartBlocks -> Logseq templates
-RE_SMARTBLOCK_TAG = re.compile(r"\s*#\[?\[?SmartBlock\]?\]?\s*", re.I)
+RE_SMARTBLOCK_TAG = re.compile(r"\s*#\[?\[?SmartBlock\]?\]?(?![\w\-])\s*", re.I)   # not "#SmartBlocks"
+
+
+def _with_marker(converted):
+    """roam_to_logseq_text gives (marker, text, ...); a property value keeps a leading task word
+    ("Status:: DONE" used to come out blank)."""
+    marker, text = converted[0], converted[1]
+    return (marker + " " + text).strip() if marker else text
 TEMPLATE_TOKEN_MAP = [
     # (Roam SmartBlock token, Logseq form). Logseq's own template variables use
     # `<% name %>` and are expanded by Logseq on insertion (they come out as page
@@ -397,7 +404,8 @@ def convert_block_text(string, uuid_for_uid, inline_checkboxes=True):
     # only checkboxes outside code count (inside code they are literal text)
     boxes = []
     outside_code(string, lambda t: (boxes.extend(RE_CHECKBOX.finditer(t)), t)[1])
-    leading = bool(boxes) and string[:boxes[0].start()].strip() == "" and len(boxes) == 1
+    # boxes hold offsets inside the non-code fragments, not in `string`: test the start of the string itself
+    leading = len(boxes) == 1 and bool(RE_CHECKBOX.match(string.lstrip()))
     if boxes and inline_checkboxes and not leading:
         n = [0]
         def repl(m):
@@ -462,7 +470,7 @@ class Converter:
                 self.counts["blocks with inline checkboxes"] += 1
                 self.counts["inline checkboxes"] += n_inline
             heading = r.get("heading") or 0
-            if heading and text and not text.startswith("#"):
+            if heading and text and not re.match(r"#{1,6}\s", text):   # "#idea ..." is a tag, not a heading already
                 text = "#" * min(int(heading), 6) + " " + text
                 self.counts["headings"] += 1
             b = Block(content=BlockContent.from_string(text), uid=derived_uuid(r["uid"]), marker=marker)
@@ -505,7 +513,7 @@ class Converter:
                 pb = Block(content=BlockContent.from_string(""), uid=derived_uuid(meta_uid))
                 for key, value in props:
                     value = convert_template_text(value)
-                    pb.properties[key] = roam_to_logseq_text(value, self._uuid_for_uid)[1] if value else ""
+                    pb.properties[key] = _with_marker(roam_to_logseq_text(value, self._uuid_for_uid)) if value else ""
                 children.insert(0, pb)
                 self.map_blocks.append({"roam_uid": meta_uid, "logseq_uuid": pb.uid, "page": page_title, "path": list(pth) + [0],
                                         "template_property_block": [k for k, _v in props]})
@@ -597,7 +605,7 @@ class Converter:
             page.children.extend(self.build_blocks(children, title))
             page.propagate_parents()
             for key, value in props:
-                value = roam_to_logseq_text(value, self._uuid_for_uid)[1] if value else ""
+                value = _with_marker(roam_to_logseq_text(value, self._uuid_for_uid)) if value else ""
                 if key in page.properties and page.properties[key]:
                     value = page.properties[key] + (", " + value if value else "")
                 page.properties[key] = value

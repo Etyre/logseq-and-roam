@@ -52,6 +52,7 @@ RE_LOGSEQ_LINK_LINE = re.compile(r"(?m)^[ \t]*Logseq link: logseq://\S*[ \t]*\n?
 RE_ROAM_LINK_LABEL = re.compile(r"(?m)^([ \t]*)Roam (web|desktop) link:")
 RE_HEADING = re.compile(r"^(#{1,6}) (.*)$", re.S)
 RE_ESCAPED_LINE = re.compile(r"(?m)^([ \t]*)\\([-#])")
+RE_ESCAPED_LATEX_DASH = re.compile(r"^(\s*\$\$.*?\$\$\s+)\\- ")   # the fixer's "$$a$$ \- " (fix_export.RE_LATEX_DASH)
 BOOKKEEPING = {"id", "button-refs", "page-tags", "collapsed", "heading", "template", "template-including-parent", "logseq.order-list-type"}
 ROAM_RENDER_SWITCH = '{{[[roam/render]]:((nU1XMzhKA)) "Block UID" }}'
 FLAG_PATTERNS = [
@@ -140,6 +141,7 @@ class Exporter:
         text = RE_LOGSEQ_LINK_LINE.sub("", text)
         text = RE_ROAM_LINK_LABEL.sub(lambda m: m.group(1) + m.group(2).capitalize() + " link:", text)
         text = RE_ESCAPED_LINE.sub(r"\1\2", text)
+        text = RE_ESCAPED_LATEX_DASH.sub(r"\1- ", text)
         return text
 
     def flag(self, page_title, text, uid):
@@ -161,7 +163,10 @@ class Exporter:
         m = RE_HEADING.match(text)
         if m and ((entry or {}).get("roam", {}).get("heading") or not entry):
             heading = len(m.group(1)); text = m.group(2)
-        if marker in ("TODO", "DONE"):
+        if marker and entry and entry.get("literal_marker"):
+            # the Roam block began with the plain word ("NOW I understand"), not a checkbox: give the word back
+            text = (marker + " " + text).rstrip()
+        elif marker in ("TODO", "DONE"):
             text = "{{[[%s]]}} %s" % (marker, text)
         elif marker in ("DOING", "NOW", "LATER", "WAITING", "IN-PROGRESS"):
             text = "{{[[TODO]]}} " + text
@@ -194,8 +199,9 @@ class Exporter:
         collapsed = str(b.properties.get("collapsed", "")).lower() == "true" and not (entry and entry.get("literal_property_line"))
         if collapsed and out.get("open", True) is not False:
             out["open"] = False
-        elif not collapsed and out.get("open") is False and entry:
-            out["open"] = True   # was collapsed in Roam, opened in Logseq
+        # A block that is not collapsed in Logseq keeps whatever "open" Roam had: the converter never wrote
+        # `collapsed:: true`, so its absence does not mean the block was opened here. (This used to set
+        # open = True and so expanded every block that was collapsed in Roam.)
         tm = (entry or {}).get("template_metadata")
         if tm:
             # a template root whose metadata block was dissolved: rebuild it from the

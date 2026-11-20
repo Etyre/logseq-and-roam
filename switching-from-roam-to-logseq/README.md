@@ -104,7 +104,12 @@ the JSON (`exports/mini-roundtrip.json` was the test file).
   (source: `backup/logseq-backup.sh`; plist in `backup/`): commits any change, pushes to the
   private repo **github.com/Etyre/main-logseq-graph**, refreshes a bare mirror
   `~/Backups/logseq/main-logseq-graph.git` and a plain file copy `~/Backups/logseq/main-logseq-graph/`
-  (both outside iCloud), and deletes iCloud conflict copies (`name 2.md`) in the graph.
+  (both outside iCloud), and moves iCloud conflict copies (`name 2.md`) out of the graph to
+  `~/Backups/logseq/conflict-copies/`. Only a file git has never tracked whose content equals
+  `name.md` (now or as last committed) counts as one; until 2026-11-20 the step deleted any
+  `name N.md` next to a `name.md`, which would have removed a real page such as `Python 3.md`
+  (the log shows it never fired). The installed copy in `~/Library/Scripts` still has the old
+  rule until `backup/install.sh` is run.
   Log: `~/Library/Logs/logseq-backup.log`. Needs Full Disk Access for `/bin/bash`
   (System Settings → Privacy & Security), granted 2026-09-05. `backup/install.sh` copies the
   script and plist into place and reloads the agent (`--status` to check); `logseq-backup.sh
@@ -153,3 +158,23 @@ the JSON (`exports/mini-roundtrip.json` was the test file).
   verification clean except the import day's journal (16 blocks, see §8), to be
   re-checked on the next day's first launch.
 - Reverse direction (`reversibility.md`): not started.
+
+## Known defects, not fixed (code review 2026-11-20)
+
+Fixed that day: plain-text task words (`NOW I understand`) came back to Roam as checkboxes; a block
+collapsed in Roam was exported as open; `Status:: DONE` in a metadata block became a blank property;
+a checkbox after inline code was flattened to the word TODO; a heading whose text starts with a tag
+lost its heading; `#SmartBlocks` was read as the `#SmartBlock` tag; the `$$..$$ \- ` escape was not
+undone on export; the normalizer wrote the sidecar under the old plain name.
+
+Still open, in rough order of weight:
+
+- The converter does not write `collapsed:: true` for blocks collapsed in Roam (they arrive expanded).
+- Two metadata children with the same key (`Tags:: #a`, `Tags:: #b`) merge into one property and export back as two identical lines.
+- Page properties added in Logseq to a converted page are dropped by `export_roam`.
+- An attribute line that is not a block's first line (`text\nURL:: x`) becomes a block property: `convert` reports a text mismatch and the export moves it to the end of the block.
+- `fix_fences` leaves a fence opened and closed on one line (```` ```x = 1``` ````) alone and splits `` ``` - note`` after a closing fence into a child block.
+- Pages whose titles collide only after the spelling fix or date parsing (`January 5th, 2024` / `January 05th, 2024`) are written as two files.
+- `fix_export` treats three parentheses like four (`(((uid)))` becomes `((uid))`), also inside code. A test expects this for `[see](((uid)))`, so it was left; check whether Logseq wants that alias with two or three.
+- `convert_buttons` rewrites `{{2}}` inside `$$...$$`.
+- `otter-import`: transcript offsets are divided by 1000 above 100000 and used as seconds below, so times jump; the Roam extension divides by 16000. Needs one real recording to confirm the unit before changing.

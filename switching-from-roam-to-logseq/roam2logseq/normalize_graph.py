@@ -37,7 +37,7 @@ from roam2logseq.serialize import page_text
 
 # Fixed namespace so derived ids are reproducible anywhere: uuid5 of a constant URL.
 NAMESPACE = uuidlib.uuid5(uuidlib.NAMESPACE_URL, "https://github.com/Etyre/ankify_logseq/roam-uid")
-ROAM_META_SKIP = {"string", "children", "uid"}
+ROAM_META_SKIP = {"string", "children", "uid", "_from_metadata"}   # the last is the converter's own scratch flag
 RE_UUID = re.compile(r"\(\(([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\)\)")
 RE_ROAM_DATE = re.compile(r"^(January|February|March|April|May|June|July|August|September|October|November|December) (\d{1,2})(?:st|nd|rd|th), (\d{4})$")
 RE_PROP_LINE = re.compile(r"^[A-Za-z0-9_.\-]+:: ?")
@@ -495,7 +495,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("graph_dir")
     ap.add_argument("roam_json", help="the FIXED Roam export that was imported")
-    ap.add_argument("--map", default=None, help="sidecar uid map output (default: GRAPH_DIR/roam-uid-map.json)")
+    ap.add_argument("--map", default=None, help="sidecar uid map output (default: GRAPH_DIR/roam-uid-map.json.gz)")
     ap.add_argument("--report", default=None)
     ap.add_argument("--dry-run", action="store_true", help="pair and report, write nothing")
     ap.add_argument("--journal-format", default="MMMM do, yyyy")
@@ -505,9 +505,10 @@ def main(argv=None):
     n = Normalizer(os.path.abspath(args.graph_dir), roam_pages, dry_run=args.dry_run)
     n.run()
     if not args.dry_run:
-        map_path = args.map or os.path.join(args.graph_dir, "roam-uid-map.json")
-        with open(map_path, "w", encoding="utf-8") as f:
-            json.dump({"namespace": str(NAMESPACE), "blocks": n.map, "dangling_refs": n.dangling}, f, ensure_ascii=False)
+        # the .gz name every reader prefers (sidecar.sidecar_path); the plain name left a stale .gz in charge
+        from roam2logseq import sidecar
+        map_path = args.map or os.path.join(args.graph_dir, sidecar.NAME)
+        sidecar.save_sidecar(map_path, {"namespace": str(NAMESPACE), "blocks": n.map, "dangling_refs": n.dangling})
         set_journal_format(args.graph_dir, args.journal_format)
     rep = n.report()
     if args.report:
