@@ -132,9 +132,13 @@ const recentlyHandled = (uid) => { const t = handled.get(uid); if (t && Date.now
 async function startConversation(uuid, text) {
   if (recentlyHandled(uuid) || core.isBusy(uuid)) return;
   const o = opts();
-  const head = core.header(core.stripTrigger(text, o), o);
   const cur = await logseq.Editor.getCurrentBlock();
-  if (cur && cur.uuid === uuid && (await logseq.Editor.checkEditing())) { await leaveEditing(); await sleep(120); }
+  if (cur && cur.uuid === uuid && (await logseq.Editor.checkEditing()) === uuid) {
+    // what the editor holds now, not the snapshot the trigger came with: text typed since would be overwritten
+    try { const now = await logseq.Editor.getEditingBlockContent(); if (typeof now === "string" && now.trim()) text = splitProps(now).body; } catch (e) {}
+    await leaveEditing(); await sleep(120);
+  }
+  const head = core.header(core.stripTrigger(text, o), o);
   await adapter.updateBlock(uuid, head);
   await run("", () => core.start(adapter, cfg(), { uuid, uid: uuid, text: head }));
 }
@@ -216,7 +220,10 @@ function wireEditor() {
 async function askHere(ctx) {
   const b = ctx && ctx.uuid ? await logseq.Editor.getBlock(ctx.uuid) : await logseq.Editor.getCurrentBlock();
   if (!b) { logseq.UI.showMsg("Claude in Logseq: put the cursor in a block first", "warning"); return; }
-  let content = (await logseq.Editor.checkEditing()) ? await logseq.Editor.getEditingBlockContent() : null;
+  // the editor's text only when it is THIS block being edited: from the block menu the cursor can sit in
+  // another block, whose text would otherwise be written over this one
+  const editing = await logseq.Editor.checkEditing();
+  let content = editing && editing === b.uuid ? await logseq.Editor.getEditingBlockContent() : null;
   if (content == null) content = b.content || "";
   const text = splitProps(content).body;
   const o = opts();

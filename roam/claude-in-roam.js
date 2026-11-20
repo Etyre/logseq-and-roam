@@ -96,6 +96,7 @@
     ]
   };
   const MARKER = "@ELI:";
+  const MARKER_LINE = new RegExp("^\\s*(?:[-*>]\\s*)?" + MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*(.*)$");
   const STORAGE_KEY = "llm-inbox:records";
   const UNCONFIRMED_KEY = "llm-inbox:unconfirmed";
   const INBOX_PAGE = "llm-inbox";
@@ -119,10 +120,12 @@
         const inp = b.input || {};
         found.push({ via: "tool", message: String(inp.message || JSON.stringify(inp)).trim() });
       } else if (b.type === "text" && typeof b.text === "string" && b.text.includes(MARKER)) {
-        const lines = b.text.split("\n");
-        const idx = lines.findIndex((l) => l.trimStart().startsWith(MARKER));
-        if (idx < 0) found.push({ via: "marker", message: b.text.slice(b.text.indexOf(MARKER) + MARKER.length).trim() });
-        else found.push({ via: "marker", message: [lines[idx].trimStart().slice(MARKER.length)].concat(lines.slice(idx + 1)).join("\n").trim() });
+        // Same rule as llm_contact.py (_MARKER_LINE): the marker counts at the start of a line, also behind a
+        // bullet or quote mark ("- @ELI: ..."). A mid-line mention (Claude explaining the preamble, a quoted
+        // title) is not a message; it used to stop the turn and file everything after it as one.
+        const lines = b.text.split(/\r?\n/);
+        const idx = lines.findIndex((l) => MARKER_LINE.test(l));
+        if (idx >= 0) found.push({ via: "marker", message: [MARKER_LINE.exec(lines[idx])[1]].concat(lines.slice(idx + 1)).join("\n").trim() });
       }
     }
     return found;
@@ -397,7 +400,15 @@
   // ---------- text helpers ----------
   // Never write three backticks literally in this file: Roam would end the roam/js code block there.
   const FENCE = "\x60\x60\x60";
-  const norm = (s) => String(s || "").replace(/\r/g, "").split("\n").filter((l) => !/^[\w-]+::\s/.test(l)).join("\n").replace(/[ \t]+/g, " ").trim();
+  // Logseq property lines ("id:: ...") follow a block's first line and are dropped; a FIRST line of that shape
+  // is a Roam attribute ("Question:: why ..."), which is content. Runs of spaces are collapsed inside a line
+  // only: indentation at the start of a line is code and is kept.
+  const norm = (s) => String(s || "").replace(/\r/g, "").split("\n").filter((l, i) => i === 0 || !/^[\w-]+::\s/.test(l)).join("\n").replace(/(\S)[ \t]+/g, "$1 ").trim();
+  // Blocks the feature itself leaves under a turn when the call failed. They are not Claude's words: they are
+  // never sent back as an assistant turn, and a follow-up holding only these can be asked again. (The
+  // "Claude asked to reach Eli" notice is different: that is what Claude did, so it stays in the transcript.)
+  const isStatus = (text) => /^(Error: |\(no reply\)$)/.test(norm(text));
+  const replyKids = (b) => (b.children || []).filter((c) => !isStatus(c.text));
   const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   function outline(trees, depth = 0) {
@@ -478,7 +489,7 @@ FORMAT (strict, the reply is written into outliner blocks):
 - When you used web search, mention the source (site or title) in the bullet that relies on it.
 - Match the depth of the request: a quick question gets a few bullets, a research question a fuller outline.`;
 
-  function contextMessage({ pageTitle, ancestors, contextTrees, request }) {
+  function contextMessage({ pageTitle, ancestors, contextTrees, request, pageTrees, under }) {
     let msg = "";
     if (pageTitle) msg += `PAGE: ${pageTitle}\n`;
     msg += "CONTEXT (the user's notes around the request, outermost first):\n";
@@ -488,7 +499,12 @@ FORMAT (strict, the reply is written into outliner blocks):
     const rest = outline(contextTrees, depth);
     if (!chain.length && !rest.trim()) msg += "(none)\n";
     msg += rest;
+    // the whole page (contextMode "page") is reference material at its real depth, apart from the context chain:
+    // nested under the deepest ancestor it repeated the chain and made an unrelated block "the deepest item"
+    if (pageTrees && outline(pageTrees).trim()) msg += "\nREST OF THE PAGE (for reference; less relevant than the context above):\n" + outline(pageTrees, 0);
     msg += "\nREQUEST: " + (request || "(none: respond to the deepest context items above)") + "\n";
+    // blocks that were already under the request block when the conversation started: the user's notes, part of the request
+    if (under && under.trim()) msg += "\nBLOCKS UNDER THE REQUEST (the user's own notes that the request is about):\n" + under;
     return msg;
   }
 
@@ -499,20 +515,27 @@ FORMAT (strict, the reply is written into outliner blocks):
    * block whose reply is being generated: it ends the message list as the last user turn
    * (or, for the marker, is skipped).
    */
-  function buildMessages({ conv, pageTitle, ancestors, contextTrees, pending, o }) {
+  function buildMessages({ conv, pageTitle, ancestors, contextTrees, pageTrees, pending, o }) {
     const request = stripTrigger(conv.text, o);
-    const msgs = [{ role: "user", content: contextMessage({ pageTitle, ancestors, contextTrees, request }) }];
+    // Children above the marker were there before the conversation started (/claude typed in a block that
+    // already had sub-blocks): they are the user's notes, not turns. Read as turns, their own children
+    // were attributed to Claude.
+    const all = conv.children || [];
+    const mi = all.findIndex((c) => isMarker(c.text, o));
+    const before = mi > 0 ? all.slice(0, mi) : [];
+    const turns = mi > 0 ? all.slice(mi) : all;
+    const msgs = [{ role: "user", content: contextMessage({ pageTitle, ancestors, contextTrees, request, pageTrees, under: outline(before) }) }];
     const push = (role, content) => {
       if (!content) return;
       const last = msgs[msgs.length - 1];
       if (last && last.role === role) last.content += "\n\n" + content; else msgs.push({ role, content });
     };
-    for (const c of conv.children || []) {
-      if (isMarker(c.text, o)) { push("assistant", outline(c.children).trim()); continue; }
+    for (const c of turns) {
+      if (isMarker(c.text, o)) { push("assistant", outline(replyKids(c)).trim()); continue; }
       const text = norm(c.text);
       if (!text) continue;
       push("user", text);
-      if (c.uid !== pending) push("assistant", outline(c.children).trim());
+      if (c.uid !== pending) push("assistant", outline(replyKids(c)).trim());
     }
     if (msgs[msgs.length - 1].role === "assistant") push("user", "Continue.");
     return msgs;
@@ -566,12 +589,18 @@ FORMAT (strict, the reply is written into outliner blocks):
   async function readSse(res, onText) {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", text = "", usage = null, stop = null, textBlocks = new Set();
+    let buf = "", text = "", usage = null, stop = null, textBlocks = new Set(), afterTool = false;
     const toolBlocks = new Map(); // index -> { type: "tool_use", id, name, json }
     const handle = (ev) => {
       if (ev.type === "content_block_start") {
-        if (ev.content_block && ev.content_block.type === "text") textBlocks.add(ev.index);
-        else if (ev.content_block && ev.content_block.type === "tool_use") toolBlocks.set(ev.index, { type: "tool_use", id: ev.content_block.id, name: ev.content_block.name, json: "" });
+        if (ev.content_block && ev.content_block.type === "text") {
+          textBlocks.add(ev.index);
+          // text resuming after a tool block (a web search) starts a new line; text blocks split only by
+          // citations follow each other directly and still join without a break
+          if (afterTool && text && !text.endsWith("\n")) { text += "\n"; if (onText) onText("\n"); }
+          afterTool = false;
+        } else if (ev.content_block) afterTool = true;
+        if (ev.content_block && ev.content_block.type === "tool_use") toolBlocks.set(ev.index, { type: "tool_use", id: ev.content_block.id, name: ev.content_block.name, json: "" });
       }
       else if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta" && textBlocks.has(ev.index)) { text += ev.delta.text; if (onText) onText(ev.delta.text); }
       else if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "input_json_delta" && toolBlocks.has(ev.index)) { toolBlocks.get(ev.index).json += ev.delta.partial_json || ""; }
@@ -637,11 +666,11 @@ FORMAT (strict, the reply is written into outliner blocks):
   /** Parse one outline line into { depth, text } (depth in bullet levels), or null for blank. */
   function parseLine(line) {
     if (!line.trim()) return null;
-    const m = /^([ \t]*)(?:([-*+•]|\d+[.)])\s+)?(.*)$/.exec(line);
+    const m = /^([ \t]*)(?:([-*+•]|\d{1,2}[.)])\s+)?(.*)$/.exec(line); // "1984. was a year" is not a list item
     const indent = m[1].replace(/\t/g, "  ").length;
     const bullet = !!m[2];
     let text = m[3].trimEnd();
-    const h = /^#{1,6}\s+(.*)$/.exec(text);
+    const h = bullet ? null : /^#{1,6}\s+(.*)$/.exec(text); // "- # of items is 5" is a bullet, not a heading
     if (h) text = h[1].trim();
     return { depth: Math.round(indent / 2), bullet, text };
   }
@@ -694,7 +723,7 @@ FORMAT (strict, the reply is written into outliner blocks):
       }
       const p = parseLine(line);
       if (!p) return;
-      if (p.text.startsWith(FENCE)) {
+      if (p.text.startsWith(FENCE) && p.text.indexOf(FENCE, 3) < 0) { // opened and closed on one line is not a block to stay inside
         const rec = live && live.depth === p.depth ? live : create(p.depth, p.text);
         rec.text = p.text; rec.strip = p.depth * 2 + (p.bullet ? 2 : 0); fence = rec; live = null; return;
       }
@@ -731,9 +760,12 @@ FORMAT (strict, the reply is written into outliner blocks):
         return { uids, count: uids.length };
       },
       async fail(message) {
-        const uid = placeholder || (live && live.uid) || null;
-        placeholder = null;
+        // a pending throttled update would fire after this and write the half-streamed line back over the error
+        if (updateTimer) { clearTimeout(updateTimer); updateTimer = null; }
         await queue;
+        // the error takes the placeholder if nothing was written yet; otherwise it gets a block of its own
+        // and the partial reply stays readable above it
+        const uid = placeholder; placeholder = null;
         if (uid) await adapter.updateBlock(uid, "Error: " + message);
         else await adapter.createBlock(parentUid, "Error: " + message, { last: true });
       },
@@ -751,11 +783,11 @@ FORMAT (strict, the reply is written into outliner blocks):
     // "parents": the chain of parent blocks only; "parents+siblings": plus the other blocks
     // under the closest parent; "page": plus every block on the page
     const mode = cfg.contextMode || "parents";
-    let contextTrees = [];
+    let contextTrees = [], pageTrees = null;
     if (mode === "parents+siblings" || mode === "parent") contextTrees = await adapter.getSiblingTrees(convUid);
-    else if (mode === "page") contextTrees = await adapter.getPageTrees(convUid);
+    else if (mode === "page") pageTrees = prune(await adapter.getPageTrees(convUid), convUid);
     contextTrees = prune(contextTrees, convUid);
-    return { conv, ancestors, contextTrees, pageTitle: conv.pageTitle };
+    return { conv, ancestors, contextTrees, pageTrees, pageTitle: conv.pageTitle };
   }
 
   /**
@@ -769,7 +801,7 @@ FORMAT (strict, the reply is written into outliner blocks):
     let writer = null;
     try {
       const s = await surroundings(adapter, convUid, cfg);
-      const messages = buildMessages({ conv: s.conv, pageTitle: s.pageTitle, ancestors: s.ancestors, contextTrees: s.contextTrees, pending: replyUnder, o: cfg });
+      const messages = buildMessages({ conv: s.conv, pageTitle: s.pageTitle, ancestors: s.ancestors, contextTrees: s.contextTrees, pageTrees: s.pageTrees, pending: replyUnder, o: cfg });
       const placeholderUid = await adapter.createBlock(replyUnder, cfg.thinkingText || "…", { last: true });
       writer = makeWriter(adapter, replyUnder, { placeholderUid, throttleMs: cfg.throttleMs });
       if (adapter.onBusy) adapter.onBusy(convUid, true);
@@ -841,12 +873,12 @@ FORMAT (strict, the reply is written into outliner blocks):
     if (isLockedReply(ancestors, o)) return true;
     const parent = (ancestors || [])[(ancestors || []).length - 1];
     if (!parent || !isConversation(parent.text, o)) return false;
-    return isMarker(block.text, o) || (block.children || []).length > 0;
+    return isMarker(block.text, o) || replyKids(block).length > 0;
   }
 
   /** Could this block take a follow-up? (parent is a conversation, it is not the marker, it has no reply yet) */
   function isFollowUpCandidate(block, parentText, o) {
-    return !!block && isConversation(parentText, o) && !isMarker(block.text, o) && !(block.children || []).length && !!norm(block.text);
+    return !!block && isConversation(parentText, o) && !isMarker(block.text, o) && !replyKids(block).length && !!norm(block.text);
   }
 
   root.ClaudeChatCore = {

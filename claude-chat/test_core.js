@@ -164,7 +164,13 @@ function fakeGraph() {
   assert.deepStrictEqual(sP.contextTrees, [], "parents is the default; parents+siblings adds siblings (none here)");
   // "page" mode includes the whole page, minus the conversation block itself
   const s2 = await core.surroundings(ad2, "T", Object.assign({}, cfg, { contextMode: "page" }));
-  assert.ok(/sibling of mid/.test(core.outline(s2.contextTrees)) && !/claude/.test(core.outline(s2.contextTrees)));
+  assert.ok(/sibling of mid/.test(core.outline(s2.pageTrees)) && !/claude/.test(core.outline(s2.pageTrees)));
+  assert.deepStrictEqual(s2.contextTrees, [], "the page is kept apart from the context chain");
+  {
+    // page mode: the chain once, the page at its real depth in its own section
+    const msg = core.contextMessage({ ancestors: [{ text: "top" }, { text: "mid" }], contextTrees: [], pageTrees: [{ uid: "z", text: "unrelated", children: [{ uid: "z1", text: "deep", children: [] }] }], request: "q" });
+    assert.ok(/\n- top\n  - mid\n\nREST OF THE PAGE[^\n]*\n- unrelated\n  - deep\n\nREQUEST: q/.test(msg), msg);
+  }
   assert.ok(!/claude/.test(req.body.messages[0].content), "trigger block itself is not in the context");
   assert.ok(/bullet outline/.test(req.body.system[0].text));
   // follow-up
@@ -252,7 +258,7 @@ function fakeGraph() {
   assert.strictEqual(g2[inbox[0].children[0]].text, "I would like to stop this thread.");
   const recs = LlmContact.records();
   assert.strictEqual(recs.length, 2, "full records kept locally");
-  assert.ok(recs[0].system.startsWith(LlmContact.PREAMBLE) && recs[0].messages[recs[0].messages.length - 1].content === "keep going" && recs[0].response.content[1].name === "contact_eli", "record carries system, messages, response, tools");
+  assert.ok(recs[0].system.startsWith(LlmContact.PREAMBLE) && recs[0].messages[recs[0].messages.length - 1].content === "again?\n\nkeep going" /* "again?" only got an Error block, which is not replayed as a reply, so the two user turns join */ && recs[0].response.content[1].name === "contact_eli", "record carries system, messages, response, tools");
   assert.strictEqual(recs[0].tools.length, 3);
 
   // ----- confirm step: "it was a task remark, keep working" -> the chat goes on, nothing is sent -----
@@ -353,4 +359,61 @@ function fakeGraph() {
   delete globalThis.localStorage;
   console.log("contact tests OK");
   console.log("core tests OK");
+})().catch((e) => { console.error(e); process.exit(1); });
+
+// ----- regressions from the 2026-11-20 bug hunt -----
+(async () => {
+  // a Roam attribute is content; code indentation survives
+  assert.strictEqual(core.norm("Question:: why is the sky blue"), "Question:: why is the sky blue");
+  assert.strictEqual(core.norm("def f():\n    if x:\n        return  1"), "def f():\n    if x:\n        return 1");
+  // status blocks are not Claude's words and do not lock a follow-up
+  const o = {};
+  const head = core.header("q", o);
+  const conv = { uid: "C", text: head, children: [
+    { uid: "M", text: core.settings.marker, children: [{ uid: "r", text: "an answer", children: [] }] },
+    { uid: "F", text: "and then?", children: [{ uid: "e", text: "Error: Claude API 529: overloaded", children: [] }] },
+  ] };
+  const msgs = core.buildMessages({ conv, ancestors: [], contextTrees: [], pending: null, o });
+  assert.ok(!msgs.some((m) => /Error: Claude API/.test(m.content)), "an error block is never replayed");
+  assert.ok(core.isFollowUpCandidate(conv.children[1], head, o), "a follow-up that only got an error can be asked again");
+  assert.ok(!core.isLockedBlock(conv.children[1], [{ text: head }], o));
+  // blocks that were under the request before the conversation started are the user's notes, not turns
+  const conv2 = { uid: "C", text: head, children: [
+    { uid: "n1", text: "note one", children: [{ uid: "n1a", text: "sub detail", children: [] }] },
+    { uid: "M", text: core.settings.marker, children: [] },
+  ] };
+  const m2 = core.buildMessages({ conv: conv2, ancestors: [], contextTrees: [], pending: "M", o });
+  assert.strictEqual(m2.length, 1);
+  assert.ok(/BLOCKS UNDER THE REQUEST[^\n]*\n- note one\n  - sub detail/.test(m2[0].content), m2[0].content);
+  // parseLine keeps real content
+  assert.strictEqual(core.parseLine("- # of items is 5").text, "# of items is 5");
+  assert.strictEqual(core.parseLine("1984. was a year").text, "1984. was a year");
+  assert.strictEqual(core.parseLine("2. second").text, "second");
+  // fail(): the error is not overwritten by a pending update and the partial line stays
+  {
+    const g = {}; let n = 0;
+    const ad = { createBlock: async (p, t) => { const u = "b" + ++n; g[u] = t; return u; }, updateBlock: async (u, t) => { g[u] = t; } };
+    const ph = await ad.createBlock("P", "…");
+    const w = core.makeWriter(ad, "P", { placeholderUid: ph, throttleMs: 20 });
+    w.push("- Hello"); w.push(" world");
+    await w.fail("boom");
+    await new Promise((r) => setTimeout(r, 80));
+    assert.ok(Object.values(g).includes("Error: boom"), JSON.stringify(g));
+    assert.ok(Object.values(g).some((t) => /^Hello/.test(t)), "the partial line is kept");
+  }
+  // a one-line fenced snippet does not swallow the bullets after it
+  {
+    const g = {}; let n = 0; const F = "\x60\x60\x60";
+    const ad = { createBlock: async (p, t) => { const u = "b" + ++n; g[u] = t; return u; }, updateBlock: async (u, t) => { g[u] = t; } };
+    const w = core.makeWriter(ad, "P", { throttleMs: 0 });
+    w.push("- " + F + "js let a=1 " + F + "\n- after one\n- after two\n");
+    const r = await w.finish();
+    assert.strictEqual(r.count, 3, JSON.stringify(g));
+  }
+  // the marker counts at the start of a line only (same rule as llm_contact.py)
+  const LC = globalThis.LlmContact;
+  assert.deepStrictEqual(LC.extract("- The preamble says a line starting with @ELI: reaches Eli."), []);
+  assert.deepStrictEqual(LC.extract("ok\n- @ELI: please stop\nmore"), [{ via: "marker", message: "please stop\nmore" }]);
+  assert.deepStrictEqual(LC.extract("@ELI: hi"), [{ via: "marker", message: "hi" }]);
+  console.log("bug-hunt regression tests OK");
 })().catch((e) => { console.error(e); process.exit(1); });

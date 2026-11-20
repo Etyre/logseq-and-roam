@@ -33,6 +33,7 @@
   // question, keep_working, decision_tool, send_value, keep_value, confirm_models: all defined in shared/llm_contact.py only
   const CONFIRM = __CONFIRM__;
   const MARKER = "@ELI:";
+  const MARKER_LINE = new RegExp("^\\s*(?:[-*>]\\s*)?" + MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*(.*)$");
   const STORAGE_KEY = "llm-inbox:records";
   const UNCONFIRMED_KEY = "llm-inbox:unconfirmed";
   const INBOX_PAGE = "llm-inbox";
@@ -56,10 +57,12 @@
         const inp = b.input || {};
         found.push({ via: "tool", message: String(inp.message || JSON.stringify(inp)).trim() });
       } else if (b.type === "text" && typeof b.text === "string" && b.text.includes(MARKER)) {
-        const lines = b.text.split("\n");
-        const idx = lines.findIndex((l) => l.trimStart().startsWith(MARKER));
-        if (idx < 0) found.push({ via: "marker", message: b.text.slice(b.text.indexOf(MARKER) + MARKER.length).trim() });
-        else found.push({ via: "marker", message: [lines[idx].trimStart().slice(MARKER.length)].concat(lines.slice(idx + 1)).join("\n").trim() });
+        // Same rule as llm_contact.py (_MARKER_LINE): the marker counts at the start of a line, also behind a
+        // bullet or quote mark ("- @ELI: ..."). A mid-line mention (Claude explaining the preamble, a quoted
+        // title) is not a message; it used to stop the turn and file everything after it as one.
+        const lines = b.text.split(/\r?\n/);
+        const idx = lines.findIndex((l) => MARKER_LINE.test(l));
+        if (idx >= 0) found.push({ via: "marker", message: [MARKER_LINE.exec(lines[idx])[1]].concat(lines.slice(idx + 1)).join("\n").trim() });
       }
     }
     return found;
