@@ -5,7 +5,8 @@
  *
  * Concepts
  *   home block     a block tagged #[[auto-generate cards]] or [[LLM-generated cards]]
- *   content blocks the home block's siblings and all their descendants (LLM: read)
+ *   content blocks the home block's siblings and all their descendants, plus the text of
+ *                  the parent block they all sit under (LLM: read)
  *   notes          blocks under the home block carrying the ankify tag, in ankify_roam /
  *                  ankify_logseq format (LLM: write, except frozen notes)
  *   groups         when there are more than a few notes they sit under labelled heading
@@ -250,6 +251,25 @@
 
   const tagToken = (t) => (/[\s#\[\]]/.test(t) ? `#[[${t}]]` : `#${t}`);
 
+  // ---------- "make cards here": a typed trigger or command turns any block into a home block ----------
+  /** Length of a slash trigger ending `before` (the text left of the cursor), 0 when there is none. */
+  function slashTriggerAt(before, triggers) {
+    const lower = String(before || "").toLowerCase();
+    for (const raw of triggers || []) {
+      const t = String(raw).toLowerCase();
+      if (!t || !lower.endsWith(t)) continue;
+      const start = lower.length - t.length;
+      if (start === 0 || /\s/.test(lower[start - 1])) return t.length;
+    }
+    return 0;
+  }
+  /** The block's text with the first home tag appended (unchanged when it already carries one). */
+  function tagAsHome(text) {
+    const t = String(text || "").replace(/\s+$/, "");
+    if (isHome(t)) return t;
+    return (t + " " + tagToken(settings.homeTags[0])).trim();
+  }
+
   /** Rewrite the home block text: keep the user's words and the home tag, swap the LLM's tags. */
   function homeTextWithTags(text, oldLlmTags, newTags) {
     let t = text || "";
@@ -379,10 +399,12 @@ MAINTENANCE
 - Any note, EDITABLE or FROZEN, is filed under a group simply by listing it there; return FROZEN notes with their uid and their current text (any text you give for them is ignored). A FROZEN note you do not list stays where it is.`;
   }
 
-  function buildUserMessage({ pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions, grouping }) {
+  function buildUserMessage({ pageTitle, parentText, contentTrees, notes, groups, state, homeTags, extraInstructions, grouping }) {
     const frozen = new Set(state.frozen);
     let msg = "";
     if (pageTitle) msg += `PAGE: ${pageTitle}\n\n`;
+    // the block everything sits under: often the title of the section, and source material like the rest
+    if (norm(parentText)) msg += "PARENT BLOCK (the block the content blocks sit under; read-only source material, usually their heading):\n" + norm(parentText) + "\n\n";
     msg += "CONTENT BLOCKS (read-only source material):\n" + (outline(contentTrees) || "(empty)\n") + "\n";
     msg += "EXISTING NOTES:\n";
     if (!notes.length) msg += "(none)\n";
@@ -675,8 +697,16 @@ MAINTENANCE
       if (changed || wrote) await writeState(adapter, homeUid, stateBlock, state);
     }
     let stale = false;
-    try { stale = state.contentHash !== contentHash(await adapter.getSiblingTrees(homeUid)); } catch (e) {}
+    try {
+      stale = state.contentHash !== contentHash(await adapter.getSiblingTrees(homeUid));
+      // parentHash is absent in state written before the parent block was sent: those blocks are not stale for that reason
+      if (!stale && state.parentHash != null) stale = state.parentHash !== hash(await parentTextOf(adapter, homeUid));
+    } catch (e) {}
     return { home, notes, stateBlock, state, stale, frozen: new Set(state.frozen) };
+  }
+
+  async function parentTextOf(adapter, homeUid) {
+    return adapter.getParentText ? norm((await adapter.getParentText(homeUid)) || "") : "";
   }
 
   async function writeState(adapter, homeUid, stateBlock, state) {
@@ -703,10 +733,11 @@ MAINTENANCE
       const { vanished } = reconcile(state, notes);
       try { await recordExamples(adapter, home, notes, state, vanished, cfg.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
       const contentTrees = await adapter.getSiblingTrees(homeUid);
-      if (!outline(contentTrees).trim()) throw new Error("no content blocks next to the home block");
+      const parentText = await parentTextOf(adapter, homeUid);
+      if (!outline(contentTrees).trim() && !parentText) throw new Error("no content blocks next to the home block");
       const hl = homeTagsLower();
       const homeTags = lowerTags(home.text).filter((t) => !hl.includes(t));
-      const user = buildUserMessage({ pageTitle: home.pageTitle, contentTrees, notes, groups, state, homeTags, extraInstructions: cfg.extraInstructions, grouping: cfg.grouping });
+      const user = buildUserMessage({ pageTitle: home.pageTitle, parentText, contentTrees, notes, groups, state, homeTags, extraInstructions: cfg.extraInstructions, grouping: cfg.grouping });
       let system = SYSTEM;
       if (cfg.promptPage && adapter.readPageTrees) {
         try { const custom = promptFromTrees(await adapter.readPageTrees(cfg.promptPage)); if (custom) system = custom; } catch (e) { console.warn("[auto-anki] prompt page unreadable, using the built-in prompt", e); }
@@ -822,6 +853,7 @@ MAINTENANCE
         state.llmTags = ops.tags;
       }
       state.contentHash = contentHash(contentTrees);
+      state.parentHash = hash(parentText);
       state.updatedAt = Date.now();
       await writeState(adapter, homeUid, stateBlock, state);
       return { created: ops.creates.length + live.notes.size, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
@@ -866,7 +898,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, normaliseCloze, homeTextWithTags, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
+    ensureAnkifyTag, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);

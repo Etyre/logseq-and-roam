@@ -60,9 +60,18 @@ assert.ok(trees.length >= 3 && trees.some((t) => t.children.length > 0));
 const back = core.promptFromTrees(trees);
 assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), "prompt survives the block round trip");
 
+// ----- "make cards here": typed trigger and tagging -----
+assert.strictEqual(core.slashTriggerAt("notes /cards", ["/cards"]), 6);
+assert.strictEqual(core.slashTriggerAt("/Cards", ["/cards"]), 6);
+assert.strictEqual(core.slashTriggerAt("see a/cards", ["/cards"]), 0, "only at the start or after a space");
+assert.strictEqual(core.slashTriggerAt("/card", ["/cards"]), 0);
+assert.strictEqual(core.tagAsHome(""), "#[[auto-generate cards]]");
+assert.strictEqual(core.tagAsHome("Cards: "), "Cards: #[[auto-generate cards]]");
+assert.strictEqual(core.tagAsHome("x #[[LLM-generated cards]]"), "x #[[LLM-generated cards]]", "a home block is left alone");
+
 // ----- full run with a fake graph + fake Claude -----
 (async () => {
-  const g = { P: { uid: "P", text: "", children: ["c1", "H"] }, c1: { uid: "c1", text: "Water boils at 100 C", children: ["c2"] }, c2: { uid: "c2", text: "at sea level", children: [] }, H: { uid: "H", text: "#[[auto-generate cards]]", children: [] } };
+  const g = { P: { uid: "P", text: "Boiling points", children: ["c1", "H"] }, c1: { uid: "c1", text: "Water boils at 100 C", children: ["c2"] }, c2: { uid: "c2", text: "at sea level", children: [] }, H: { uid: "H", text: "#[[auto-generate cards]]", children: [] } };
   let n = 0;
   const tree = (uid) => ({ uid, text: g[uid].text, children: g[uid].children.map(tree) });
   const parentOf = (uid) => Object.keys(g).find((k) => g[k].children.includes(uid));
@@ -79,9 +88,12 @@ assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), 
     { tags: ["physics", "water"], notes: [{ uid: "n1", text: "Water boils at {c1:100 C} at {c2:sea level}", back: [] }], delete: ["n2"] },
   ];
   let calls = 0;
+  const userMessages = [];
+  adapter.getParentText = async (uid) => g[parentOf(uid)].text;
   const fetchImpl = async (url, opts) => {
     calls++;
     const body = JSON.parse(opts.body);
+    userMessages.push(body.messages[0].content);
     assert.ok(body.output_config.format.type === "json_schema");
     assert.strictEqual(body.system[0].text, LlmContact.systemPrompt(promptPage ? "custom prompt" : core.SYSTEM), "shared preamble first, then the (prompt page or built-in) prompt");
     assert.deepStrictEqual(body.tools, [LlmContact.CONTACT_TOOL], "contact_eli offered on every call");
@@ -105,6 +117,19 @@ assert.strictEqual(back.replace(/\s+/g, " "), core.SYSTEM.replace(/\s+/g, " "), 
   assert.ok(!/ankify/.test(g[stateUid].text), "state block never contains the ankify tag (ankify_roam would ankify it)");
   let ref = await core.refresh(adapter, "H");
   assert.strictEqual(ref.stale, false); assert.deepStrictEqual(ref.state.frozen, []);
+  // the parent block is source material too: sent with the request, and editing it makes the section stale
+  assert.ok(/PARENT BLOCK[^\n]*\nBoiling points\n/.test(userMessages[0]), "parent block text is sent");
+  assert.ok(userMessages[0].indexOf("PARENT BLOCK") < userMessages[0].indexOf("CONTENT BLOCKS"));
+  g.P.text = "Boiling points of water";
+  assert.strictEqual((await core.refresh(adapter, "H")).stale, true, "an edited parent block makes the section stale");
+  g.P.text = "Boiling points";
+  { // state written before the parent was sent has no parentHash: not stale on that account
+    const saved = g[stateUid].text;
+    g[stateUid].text = saved.replace(/"parentHash":"[0-9a-f]+",?/, "").replace(/,}/, "}");
+    assert.ok(!/parentHash/.test(g[stateUid].text));
+    assert.strictEqual((await core.refresh(adapter, "H")).stale, false, "old state without parentHash is not stale");
+    g[stateUid].text = saved;
+  }
   // user edits n2's back and adds content
   g.n2.children.push("u1"); g.u1 = { uid: "u1", text: "and a user note", children: [] };
   g.c2.text = "at sea level; lower at altitude";

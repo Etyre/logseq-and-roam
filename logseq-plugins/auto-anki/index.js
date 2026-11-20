@@ -1,7 +1,9 @@
 /**
  * Auto-anki (Logseq file graphs). Counterpart of roam/auto-anki.js; shares core.js.
  *
- * Tag a block with one of the home tags (setting). Its siblings and their descendants
+ * Tag a block with one of the home tags (setting), or use the slash command /cards in it
+ * (also "Auto-anki: make cards here" in the command palette and the block menu), which adds
+ * the tag and runs at once. The block's parent and its siblings with their descendants
  * are the source material; its children are the Anki notes the LLM writes in
  * ankify_logseq format. Update with the small button on the block, the command palette
  * or the block context menu. Notes you edit change colour and are never touched again.
@@ -60,6 +62,13 @@ const adapter = {
     if (home.parentIsPage) kids = await logseq.Editor.getPageBlocksTree(home.pageTitle || home.pageId);
     else { const p = await logseq.Editor.getBlock(home.parentUid, { includeChildren: true }); kids = (p && p.children) || []; }
     return (kids || []).filter((b) => b && b.uuid).map(toTree).filter((t) => t.uid !== uid && !t["preBlock?"] && !core.isHome(t.text));
+  },
+  async getParentText(uid) {
+    // a top-level block's parent is the page: the page title is sent separately
+    const home = await this.getBlock(uid);
+    if (!home || !home.parentUid || home.parentIsPage) return "";
+    const p = await logseq.Editor.getBlock(home.parentUid);
+    return p ? splitProps(p.content).body : "";
   },
   async createBlock(parentUid, text, where) {
     let block;
@@ -242,6 +251,30 @@ async function runCommand(ctx) {
   update(uid);
 }
 
+// "make cards here": tag the block as a home block and run at once (slash command, palette, right-click)
+async function makeCardsHere(ctx) {
+  try {
+    const cur = await logseq.Editor.getCurrentBlock();
+    const uuid = (ctx && ctx.uuid) || (cur && cur.uuid);
+    if (!uuid) { logseq.UI.showMsg("Auto-anki: put the cursor in a block first", "warning"); return; }
+    const home = await homeFromUid(uuid);
+    if (home) { update(home); return; } // already inside a card section: same as "update cards"
+    if (core.isBusy(uuid)) return;
+    let content = null;
+    if (cur && cur.uuid === uuid && (await logseq.Editor.checkEditing())) {
+      content = await logseq.Editor.getEditingBlockContent();
+      // leave the editor first, or what it holds would overwrite the tag when it saves
+      try { await logseq.Editor.exitEditingMode(false); } catch (e) {}
+      await sleep(150);
+    }
+    if (content == null) { const b = await logseq.Editor.getBlock(uuid); content = (b && b.content) || ""; }
+    const body = splitProps(content).body.replace(/(^|\s)\/cards?\s*$/i, "$1"); // in case Logseq left the typed command behind
+    await adapter.updateBlock(uuid, core.tagAsHome(body));
+    decorate();
+    update(uuid);
+  } catch (e) { console.error("[auto-anki]", e); logseq.UI.showMsg("Auto-anki failed: " + e.message, "error", { timeout: 8000 }); }
+}
+
 function main() {
   logseq.useSettingsSchema(SETTINGS);
   const applySettings = () => { const c = S(); core.settings.homeTags = homeTagList(); core.settings.offTags = String(c.offTags || "").split(",").map((t) => t.trim()).filter(Boolean); core.settings.examplesPage = c.examplesPage; core.settings.ankifyTag = c.ankifyTag; };
@@ -271,6 +304,9 @@ function main() {
 
   logseq.App.registerCommandPalette({ key: "auto-anki-update", label: "Auto-anki: update cards" }, () => runCommand(null));
   logseq.Editor.registerBlockContextMenuItem("Auto-anki: update cards", (ctx) => runCommand(ctx));
+  logseq.Editor.registerSlashCommand("cards", () => makeCardsHere(null));
+  logseq.App.registerCommandPalette({ key: "auto-anki-make-here", label: "Auto-anki: make cards here" }, () => makeCardsHere(null));
+  logseq.Editor.registerBlockContextMenuItem("Auto-anki: make cards here", (ctx) => makeCardsHere(ctx));
   logseq.App.registerCommandPalette({ key: "auto-anki-open-examples", label: "Auto-anki: open examples" }, () => adapter.openPage(S().examplesPage || "auto-anki/examples"));
   // records kept in this plugin's storage when Claude asked for Eli; paste into `llm_contact.py report` (README)
   logseq.App.registerCommandPalette({ key: "auto-anki-copy-inbox", label: "Auto-anki: copy LLM inbox records" }, async () => {

@@ -2,8 +2,10 @@
  * Auto-anki for Roam Research (roam/js). Requires core.js above it in the same file
  * (roam/auto-anki.js is built from both by auto-anki/build.sh).
  *
- * Tag a block with one of CONFIG.homeTags. Its siblings (and their descendants) are the
- * source material; its children are the Anki notes the LLM writes (under labelled
+ * Tag a block with one of CONFIG.homeTags, or type /cards in it (CONFIG.slashTriggers; also
+ * "Auto-anki: make cards here" in the command palette and the block menu), which adds the
+ * tag and runs at once. The block's parent and its siblings (with their descendants) are
+ * the source material; its children are the Anki notes the LLM writes (under labelled
  * headings once there are more than a few, see CONFIG.grouping). Trigger an update
  * with the small button on the block, the command palette ("Auto-anki: update cards")
  * or the block context menu. Notes you edit turn a different colour and are never
@@ -15,6 +17,7 @@
 (function () {
   const CONFIG = {
     homeTags: ["auto-generate cards", "LLM-generated cards"],
+    slashTriggers: ["/cards"], // typing one of these in a block tags it with the first home tag and makes the cards at once
     offTags: ["auto-anki off"], // add one of these to a home block to switch it off
     templateTags: ["roam/templates", "SmartBlock"], // home blocks under one of these (a template definition) are off
     ankifyTag: "ankify",
@@ -66,6 +69,12 @@
       if (!home || !home.parentUid) return [];
       const parent = api.pull(`[:block/uid {:block/children ${TREE}}]`, [":block/uid", home.parentUid]);
       return sortKids(parent).map(toTree).filter((t) => t.uid !== uid && !core.isHome(t.text));
+    },
+    async getParentText(uid) {
+      // a top-level block's parent is the page, which has no string: the page title is sent separately
+      const b = api.pull("[{:block/_children [:block/string]}]", [":block/uid", uid]);
+      const p = b && b[":block/_children"];
+      return (p && p[0] && p[0][":block/string"]) || "";
     },
     async createBlock(parentUid, text, where) {
       const uid = api.util.generateUID();
@@ -271,6 +280,61 @@
     update(uid);
   }
 
+  // ---------- make cards here: the typed trigger and the command ----------
+  const isBlockTextarea = (t) => t && t.tagName === "TEXTAREA" && t.classList.contains("rm-block-input");
+  const uidFromTextareaId = (id) => (id && id.length > 9 ? id.slice(-9) : null);
+  const blockText = (uid) => { const b = api.pull("[:block/string]", [":block/uid", uid]); return (b && b[":block/string"]) || ""; };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** Tag the block as a home block and run. `ta` is the block's textarea while it is being edited. */
+  async function makeCardsHere(uid, ta, text) {
+    if (core.isBusy(uid)) return;
+    const tagged = core.tagAsHome(text);
+    if (ta && ta.isConnected) {
+      // Roam owns the textarea: write through it and leave edit mode, or its copy would overwrite ours
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(ta, tagged);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      ta.focus();
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+      await sleep(80);
+      if (document.querySelector("textarea.rm-block-input")) {
+        // Escape went to Roam's own "/" menu instead of ending the edit: click outside (same fallback as Claude in Roam)
+        const outside = document.querySelector(".roam-article") || document.body;
+        for (const type of ["mousedown", "mouseup", "click"]) outside.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      for (let i = 0; i < 15 && blockText(uid) !== tagged; i++) await sleep(100);
+    }
+    // the run rewrites the home block from what is stored, so the tag must be there before it starts
+    if (blockText(uid) !== tagged) await adapter.updateBlock(uid, tagged);
+    decorate();
+    update(uid);
+  }
+
+  const triggered = new Map(); // uid -> time: the input event repeats while Roam re-renders
+  document.addEventListener("input", (e) => {
+    const ta = e.target;
+    if (!isBlockTextarea(ta)) return;
+    const uid = uidFromTextareaId(ta.id);
+    if (!uid) return;
+    const value = ta.value, cursor = ta.selectionStart;
+    const len = core.slashTriggerAt(value.slice(0, cursor), CONFIG.slashTriggers);
+    if (!len) return;
+    if (Date.now() - (triggered.get(uid) || 0) < 5000) return;
+    triggered.set(uid, Date.now());
+    const text = value.slice(0, cursor - len) + value.slice(cursor);
+    setTimeout(() => makeCardsHere(uid, ta, text).catch((err) => { console.error("[auto-anki]", err); toast("Auto-anki failed: " + err.message, "error"); }), 0);
+  }, true);
+
+  function makeHereCommand(ctx) {
+    const f = api.ui.getFocusedBlock && api.ui.getFocusedBlock();
+    const uid = (ctx && ctx["block-uid"]) || (f && f["block-uid"]);
+    if (!uid) { toast("Auto-anki: put the cursor in a block first", "warning"); return; }
+    const home = homeFromUid(uid);
+    if (home) { update(home); return; } // already inside a card section: same as "update cards"
+    const ta = [...document.querySelectorAll("textarea.rm-block-input")].find((t) => uidFromTextareaId(t.id) === uid);
+    makeCardsHere(uid, ta, ta ? ta.value : blockText(uid)).catch((err) => { console.error("[auto-anki]", err); toast("Auto-anki failed: " + err.message, "error"); });
+  }
+
   function askKey() {
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center;";
@@ -291,6 +355,7 @@
   const cmd = { label: "Auto-anki: update cards", callback: () => runCommand(null) };
   if (CONFIG.hotkey) cmd["default-hotkey"] = CONFIG.hotkey;
   api.ui.commandPalette.addCommand(cmd);
+  api.ui.commandPalette.addCommand({ label: "Auto-anki: make cards here", callback: () => makeHereCommand(null) });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: set API key", callback: askKey });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: open examples", callback: () => adapter.openPage(CONFIG.examplesPage) });
   // records kept in this browser when Claude asked for Eli; paste into `llm_contact.py report` (README)
@@ -311,6 +376,7 @@
     } catch (e) { console.error("[auto-anki]", e); toast("Auto-anki: could not open the prompt page: " + e.message, "error"); }
   } });
   if (api.ui.blockContextMenu) api.ui.blockContextMenu.addCommand({ label: "Auto-anki: update cards", callback: (ctx) => runCommand(ctx) });
+  if (api.ui.blockContextMenu) api.ui.blockContextMenu.addCommand({ label: "Auto-anki: make cards here", callback: (ctx) => makeHereCommand(ctx) });
   window.autoAnki = { update, config: CONFIG, adapter, core };
   console.log("[auto-anki] loaded");
 })();

@@ -31,7 +31,8 @@ reload the Logseq plugin.
 | | |
 |---|---|
 | Home block | any block carrying a home tag (setting) |
-| Content blocks | the home block's siblings and all their descendants; other home blocks and their subtrees are excluded |
+| Make cards here | added 2026-11-19: type `/cards` in any block (Roam: `CONFIG.slashTriggers`; Logseq: the slash command "cards"), or run "Auto-anki: make cards here" from the command palette or the block's right-click menu. The trigger text is removed, the first home tag is appended to whatever else the block holds, and the run starts at once; from then on it is an ordinary home block. Inside an existing card section the command just updates that section. |
+| Content blocks | the text of the home block's parent block (sent as PARENT BLOCK; nothing when the parent is the page, whose title is sent anyway), and the home block's siblings and all their descendants; other home blocks and their subtrees are excluded. Nothing else on the page is read. |
 | Notes | under the home block; `{c1:…}` / `{c1:…::hint}` cloze or question + child-block answers; `#ankify` appended automatically |
 | Headings | with more than 6 notes (setting) the model files every note under a labelled heading block; each leaf heading holds 2 to 6 notes (settings), and a heading may hold sub-headings instead of notes (two levels at most). A heading is any tagless block under the home block with notes below it. The model keeps, retitles or adds headings and may move any note between them (frozen notes move but keep their text). Headings the model made are deleted once nothing is left under them. |
 | Home block tags | the model adds topic tags after the home tag; it replaces only the tags it wrote last time |
@@ -41,6 +42,6 @@ reload the Logseq plugin.
 | Prompt | page `auto-anki/prompt` (setting); "Auto-anki: edit prompt" seeds it from the built-in text; empty/missing = built-in |
 | Off | a home block carrying an off tag (setting, default `auto-anki off`) or sitting inside a template definition (Roam: ancestor tagged `#roam/templates` or `#SmartBlock`; Logseq: ancestor with `template::`) is inactive: dashed grey border, no button, no tracking; commands refuse it. Blocks created from the template are active. |
 | Streaming | the answer streams in and every new note (and the heading it sits under) is written the moment the model finishes it, so the cards fill in block by block; the bar counts "N written…" meanwhile. Updates, moves and deletions of existing notes and heading retitles wait for the complete answer. If the call fails half way or Claude asks for Eli, the blocks written so far are deleted again, so a run is still all or nothing |
-| Stale dot | amber when the content hash differs from the last run |
+| Stale dot | amber when the content hash, or the parent block's text, differs from the last run (sections last run before 2026-11-19 have no parent hash and do not turn amber for that reason) |
 | Card count | the bar on the home block shows "N cards", plus "· k edited" when some notes are frozen; refreshed with the status |
 | Auto-update | off by default; when on, a run starts after the content has been quiet for N minutes |
