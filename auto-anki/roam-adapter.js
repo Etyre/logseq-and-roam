@@ -359,7 +359,7 @@
   api.ui.commandPalette.addCommand({ label: "Auto-anki: make cards here", callback: () => makeHereCommand(null) });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: set API key", callback: askKey });
   api.ui.commandPalette.addCommand({ label: "Auto-anki: open examples", callback: () => adapter.openPage(CONFIG.examplesPage) });
-  // records kept in this browser when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  // records kept in this browser when Claude asked for Eli or left him a note (note_to_eli; marked halts: false); paste into `llm_contact.py report` (README)
   api.ui.commandPalette.addCommand({ label: "Auto-anki: copy LLM inbox records", callback: async () => {
     const r = await window.LlmContact.copyRecords();
     toast(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this browser", "info");

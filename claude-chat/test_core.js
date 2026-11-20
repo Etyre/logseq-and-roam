@@ -12,6 +12,12 @@ const o = { triggerPages: ["claude in roam"], slashTriggers: ["/claude"], marker
 const SHARED = path.join(process.env.HOME, "Documents/agent-coding/shared");
 assert.strictEqual(LlmContact.PREAMBLE, fs.readFileSync(path.join(SHARED, "llm-system-prompt-preamble.md"), "utf8").trim(), "llm-contact.js is stale: run llm-contact/build.sh");
 assert.deepStrictEqual(LlmContact.CONTACT_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "contact_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.NOTE_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "note_to_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
+// the acknowledgement that answers a note_to_eli call is defined in llm_contact.py only
+const noteResult = /^NOTE_RESULT_TEXT = (".*")\s*$/m.exec(fs.readFileSync(path.join(SHARED, "llm_contact.py"), "utf8"));
+assert.ok(noteResult, "NOTE_RESULT_TEXT is no longer a one-line string in shared/llm_contact.py: update this test");
+assert.strictEqual(LlmContact.NOTE_RESULT_TEXT, JSON.parse(noteResult[1]), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.CONTACT_TOOLS, [LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL]);
 
 // ----- triggers -----
 assert.strictEqual(core.slashTriggerAt("what about /claude", o), 7);
@@ -113,16 +119,16 @@ function fakeGraph() {
   console.log("writer tests OK");
 
   // ----- streaming + full conversation -----
-  const sse = (chunks, toolCall) => {
+  const sse = (chunks, toolCall, toolName = "contact_eli") => {
     const events = [`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: {} })}\n\n`,
       `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "server_tool_use", name: "web_search" } })}\n\n`,
       `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
       `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } })}\n\n`];
     for (const c of chunks) events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: c } })}\n\n`);
     events.push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n`);
-    if (toolCall) { // a client tool call (contact_eli), its input streamed in pieces
+    if (toolCall) { // a client tool call (contact_eli, or note_to_eli), its input streamed in pieces
       const json = JSON.stringify(toolCall);
-      events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "tu1", name: "contact_eli", input: {} } })}\n\n`);
+      events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "tu1", name: toolName, input: {} } })}\n\n`);
       for (let i = 0; i < json.length; i += 5) events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: json.slice(i, i + 5) } })}\n\n`);
       events.push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n`);
     }
@@ -149,7 +155,7 @@ function fakeGraph() {
   assert.strictEqual(r1.lastUid, reply[1].uid);
   const req = requests[0];
   assert.strictEqual(req.body.model, "claude-opus-5-5"); assert.strictEqual(req.body.output_config.effort, "low"); assert.strictEqual(req.body.stream, true);
-  assert.deepStrictEqual(req.body.tools, [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, LlmContact.CONTACT_TOOL], "web search plus contact_eli");
+  assert.deepStrictEqual(req.body.tools, [{ type: "web_search_20260209", name: "web_search", max_uses: 5 }, LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL], "web search plus contact_eli and note_to_eli");
   assert.ok(req.body.system[0].text.startsWith(LlmContact.PREAMBLE + "\n\n"), "the shared preamble comes first, word for word");
   assert.strictEqual(req.body.fallbacks, "default"); assert.strictEqual(req.headers["anthropic-dangerous-direct-browser-access"], "true");
   assert.strictEqual(req.body.messages.length, 1);
@@ -247,7 +253,7 @@ function fakeGraph() {
   const recs = LlmContact.records();
   assert.strictEqual(recs.length, 2, "full records kept locally");
   assert.ok(recs[0].system.startsWith(LlmContact.PREAMBLE) && recs[0].messages[recs[0].messages.length - 1].content === "keep going" && recs[0].response.content[1].name === "contact_eli", "record carries system, messages, response, tools");
-  assert.strictEqual(recs[0].tools.length, 2);
+  assert.strictEqual(recs[0].tools.length, 3);
 
   // ----- confirm step: "it was a task remark, keep working" -> the chat goes on, nothing is sent -----
   replies.push(["- A remark\n- cut off mid-li"], ["- The real answer\n", "  - with detail"]);
@@ -291,6 +297,59 @@ function fakeGraph() {
   assert.ok(r8.contact && r8.contact.via === "tool" && r8.contact.model === "claude-opus-5-5" && r8.contact.message === "Just a remark, perhaps.");
   assert.strictEqual(decisions.length, asked8, "no question asked");
   assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
+
+  // ----- note_to_eli: the note is delivered once, the call is answered, and the reply carries on -----
+  // Fake Claude: the first reply ends in a note_to_eli call, the next one is ordinary. Never the forced question.
+  const noteFetch = (toolCall) => { let n = 0; return async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    assert.ok(!body.tool_choice, "a note is never questioned");
+    requests.push({ body, headers: opts.headers });
+    return sse(replies.shift(), n++ === 0 ? toolCall : null, "note_to_eli");
+  }; };
+  const inboxLen = () => g2[pages["llm-inbox"]].children.length;
+  // a reply that is only the note (no text): one more call, then the normal answer
+  replies.push([], ["- The answer\n", "  - with detail"]);
+  const f9 = await ad2.createBlock("T", "what is on this page?");
+  const before9 = requests.length, seen9 = notices.length, inbox9 = inboxLen();
+  const r9 = await quiet(() => core.followUp(ad2, Object.assign({}, haiku, { fetchImpl: noteFetch({ message: "The page title has a typo." }) }), { uid: f9 }));
+  assert.ok(!r9.contact && r9.stop === "end_turn" && r9.text === "- The answer\n  - with detail", "a note does not stop the turn and is not the answer");
+  assert.deepStrictEqual(g2[f9].children.map((c) => g2[c].text), ["The answer"], "only the answer is written as the reply");
+  assert.strictEqual(requests.length, before9 + 2, "one more call after the note");
+  const cont9 = requests[requests.length - 1].body;
+  assert.ok(!cont9.tool_choice && cont9.stream === true && cont9.output_config.effort === "low", "the continued call is an ordinary one");
+  assert.deepStrictEqual(cont9.messages.slice(-2), [
+    { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "note_to_eli", input: { message: "The page title has a typo." } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: LlmContact.NOTE_RESULT_TEXT }] },
+  ]);
+  assert.strictEqual(cont9.messages[cont9.messages.length - 3].content, "what is on this page?");
+  assert.strictEqual(LlmContact.records().length, 5, "the note is recorded once");
+  const note9 = LlmContact.records()[4];
+  assert.deepStrictEqual([note9.type, note9.via, note9.halts, note9.message, note9.app, note9.model], ["contact", "note", false, "The page title has a typo.", "claude-in-roam", "claude-haiku-4-5"]);
+  assert.ok(note9.system.startsWith(LlmContact.PREAMBLE) && note9.messages[note9.messages.length - 1].content === "what is on this page?" && note9.response.content[1].name === "note_to_eli" && note9.response.stop_reason === "tool_use" && note9.tools.length === 3, "the note record carries system, messages, response, tools");
+  assert.deepStrictEqual(r9.notes.map((n) => n.id), [note9.id]);
+  assert.strictEqual(inboxLen(), inbox9 + 1, "one entry on the inbox page");
+  const entry9 = g2[g2[pages["llm-inbox"]].children[inbox9]];
+  assert.ok(/ · via note \(task carried on\)$/.test(entry9.text) && g2[entry9.children[0]].text === "The page title has a typo.", entry9.text);
+  assert.deepStrictEqual(notices.slice(seen9).map((n) => n.kind), ["info"], "told quietly, no warning");
+  assert.ok(!g2[f9].children.some((c) => /asked to reach Eli/.test(g2[c].text)));
+  assert.strictEqual(LlmContact.unconfirmed().length, 1);
+  assert.deepStrictEqual(ad2.focused && ad2.focused.uid, r9.lastUid, "cursor moves on as after any reply");
+  // text, then a note, then more text: both parts land in the same reply (default model)
+  replies.push(["- First part\n- cut off mid-li"], ["- Second part"]);
+  const f10 = await ad2.createBlock("T", "and the rest?");
+  const r10 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: noteFetch({ message: "Web search was slow today." }) }), { uid: f10 }));
+  assert.ok(!r10.contact && r10.notes.length === 1 && r10.notes[0].model === "claude-opus-5-5");
+  assert.deepStrictEqual(g2[f10].children.map((c) => g2[c].text), ["First part", "cut off mid-li", "Second part"]);
+  assert.deepStrictEqual(requests[requests.length - 1].body.messages.slice(-2)[0].content[0], { type: "text", text: "- First part\n- cut off mid-li" });
+  assert.ok(LlmContact.records().length === 6 && inboxLen() === inbox9 + 2);
+  // the stored records are what "copy LLM inbox records" exports: a note says so itself (halts: false), a stop does not
+  assert.deepStrictEqual(LlmContact.exportJsonl().split("\n").map((l) => JSON.parse(l)).map((r) => [r.via, r.halts]), [["tool", undefined], ["marker", undefined], ["tool", undefined], ["tool", undefined], ["note", false], ["note", false]]);
+  // and a contact_eli call after all this still stops the turn
+  replies.push([]);
+  const f11 = await ad2.createBlock("T", "one more");
+  const r11 = await quiet(() => core.followUp(ad2, Object.assign({}, cfg, { fetchImpl: confirmFetch({ message: "Please stop here." }, "task_remark_keep_working") }), { uid: f11 }));
+  assert.ok(r11.contact && r11.contact.via === "tool" && r11.contact.halts === undefined && r11.notes.length === 0);
+  assert.ok(g2[f11].children.some((c) => /asked to reach Eli/.test(g2[c].text)) && notices[notices.length - 1].kind === "warning" && LlmContact.records().length === 7);
   delete globalThis.localStorage;
   console.log("contact tests OK");
   console.log("core tests OK");

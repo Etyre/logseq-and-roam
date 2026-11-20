@@ -15,11 +15,16 @@ get the reply streamed into nested blocks, then keep the thread going with Enter
   `../roam/claude-in-roam.js`.
 - `../logseq-plugins/claude-in-logseq/` — Logseq plugin; `build.sh` copies `core.js` there.
 - `test_core.js` — `node claude-chat/test_core.js` runs the core against a fake graph and a
-  fake streaming Claude (including a streamed `contact_eli` call, an `@ELI:` line, and the confirm
-  step: keep working, send, and a failing question call).
-- `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and `contact_eli` tool, baked in
-  by `build.sh`; every system prompt starts with the preamble and every call offers the tool. When
-  Claude uses either, the turn stops, the message goes to the graph page `llm-inbox` and the full
+  fake streaming Claude (including a streamed `contact_eli` call, an `@ELI:` line, the confirm
+  step: keep working, send, and a failing question call; and `note_to_eli` calls: the note is
+  recorded once and the reply carries on).
+- `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and the `contact_eli` and
+  `note_to_eli` tools, baked in by `build.sh`; every system prompt starts with the preamble and every
+  call offers both tools. A `note_to_eli` call (added 2026-11-20) does not stop the turn: the note
+  goes to the page `llm-inbox` and to the records (marked `via: "note", halts: false`) with an info
+  notice, the call is answered with the shared acknowledgement, and Claude is asked again (at most 3
+  times); whatever it writes next continues the same reply. When
+  Claude calls `contact_eli` or writes an `@ELI:` line, the turn stops, the message goes to the graph page `llm-inbox` and the full
   record to localStorage ("Claude in Roam/Logseq: copy LLM inbox records" exports it; see the
   top-level README). For a model on the shared confirm list (today only `claude-haiku-4-5`; not
   the default `claude-opus-5-5`, whose calls are sent unasked) a `contact_eli` call is first put to

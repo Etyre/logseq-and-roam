@@ -30,15 +30,32 @@ README with the detail; this file is the map and the operating manual.
   entered once per browser/plugin and never stored in the graph.
 - **LLM inbox** (`llm-contact/`): every system prompt starts with the shared preamble from
   `~/Documents/agent-coding/shared/llm-system-prompt-preamble.md` and every call offers the
-  `contact_eli` tool. Browser code cannot read files or run python, so `llm-contact/build.sh`
-  bakes both into `llm-contact.js` (word for word; the tests fail when the copy is stale) and
-  the two build scripts ship it with the Roam files and the plugins. When Claude calls the
-  tool or writes an `@ELI:` line, the core stops that task (Auto-anki writes no cards; a chat
+  `contact_eli` tool (stops the task) and, since 2026-11-20, the `note_to_eli` tool (does not; next
+  bullet). Browser code cannot read files or run python, so `llm-contact/build.sh`
+  bakes the preamble and both tools into `llm-contact.js` (word for word; the tests fail when the copy is stale) and
+  the two build scripts ship it with the Roam files and the plugins. When Claude calls
+  `contact_eli` or writes an `@ELI:` line, the core stops that task (Auto-anki writes no cards; a chat
   turn gets no further processing), appends the message to the graph page `llm-inbox`, keeps
   the full record (system prompt, messages, response, tools) in the browser's localStorage,
   and shows a warning. "copy LLM inbox records" (command palette) copies those records as
   JSON lines for `shared/llm_contact.py report`, which puts them in the real inbox and
   notifies Eli (see Common tasks).
+- **Notes** (added 2026-11-20; `withNotes` in `llm-contact/template.js`, a port of `with_notes` in
+  `shared/llm_contact.py`): a `note_to_eli` call leaves Eli a message and the task carries on. Neither
+  feature has a tool loop of its own (web search runs on Anthropic's side), so the core records the
+  note, appends Claude's turn plus a `tool_result` carrying the shared acknowledgement
+  (`NOTE_RESULT_TEXT`, baked in by the build) and asks again, at most 3 times; the chat reply goes on
+  in the same blocks, Auto-anki drops whatever cards had streamed and takes the new answer. One
+  exception in Auto-anki: a response that holds a complete JSON answer next to the note is used as
+  the answer without asking again, because a second answer would replace the first. A note is never
+  read as the answer and never stops anything. It travels the same route as a stop: an entry on the
+  graph page `llm-inbox` (header ends "via note (task carried on)"), an info notice instead of a
+  warning, and a full record in localStorage `llm-inbox:records` marked `via: "note", halts: false`.
+  `llm_contact.py report` reads that flag: it files the record as a note (normal priority, "left you
+  a note (task carried on)") and exits 0. Each note is recorded once (per response; `check()` records
+  any note `withNotes` did not see, as a safety net). A response with a note and a `contact_eli` call
+  or `@ELI:` line records both and stops. Like the confirm step, it only runs once the rebuilt files
+  are re-pasted and the plugins reloaded.
 - **Confirm step** (added 2026-11-10; `withConfirm` in `llm-contact/template.js`, a port of
   `with_confirm` in `shared/llm_contact.py`): small models call `contact_eli` for routine remarks
   about the task, so for a model in the shared `CONFIRM_MODELS` list (prefixes baked in as
@@ -70,7 +87,7 @@ README with the detail; this file is the map and the operating manual.
 | `Claude-in-roam _ Claude-in-logseq.md` | Eli's original spec for the Claude-in-outliner feature. |
 | `claude-chat/` | "Claude in Roam / Logseq": `core.js` (triggers, prompt, streaming SSE reader, outline writer, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `README.md`. |
 | `auto-anki/` | "Auto-anki": `core.js` (state block, frozen notes, prompt, streamed structured-output call that writes each card as it arrives, planner, inbox check), `roam-adapter.js`, `build.sh`, `test_core.js`, `card-principles.md`, `README.md`. |
-| `llm-contact/` | `build.sh` generates `llm-contact.js` (preamble, `contact_eli` tool, `extract`/`check`, the confirm step, local record stores) from `template.js` and the shared files, then runs `test.js` (confirm step against stubbed model calls). Both other build scripts call it. |
+| `llm-contact/` | `build.sh` generates `llm-contact.js` (preamble, `contact_eli` and `note_to_eli` tools, `extract`/`check`, `withNotes`, the confirm step, local record stores) from `template.js` and the shared files, then runs `test.js` (confirm step and note tool against stubbed model calls). Both other build scripts call it. |
 | `roam/` | Paste-in `roam/js` blocks: `claude-in-roam.js` and `auto-anki.js` (generated, do not edit), `backwards-embed.js`; `README.md` has the install steps. |
 | `logseq-plugins/` | One folder per unpacked Logseq plugin; `README.md` lists them. `claude-in-logseq/` and `auto-anki/` receive `core.js` and `llm-contact.js` from the build scripts. |
 | `ankify_logseq/` | Python package + tests; `README.md`, `DESIGN.md`, `CHANGELOG.md`. |
@@ -102,9 +119,9 @@ claude-chat/build.sh
 # and in Logseq: Plugins → the plugin → reload (or toggle it off and on)
 
 # Tests without any API key or running app
-node auto-anki/test_core.js          # fake graph + fake Claude, incl. a contact_eli call and an @ELI: line
-node claude-chat/test_core.js        # fake streaming Claude, incl. a streamed contact_eli call
-node llm-contact/test.js             # the confirm step alone: keep / send / unclear / failing question call
+node auto-anki/test_core.js          # fake graph + fake Claude, incl. a contact_eli call, an @ELI: line and note_to_eli calls
+node claude-chat/test_core.js        # fake streaming Claude, incl. streamed contact_eli and note_to_eli calls
+node llm-contact/test.js             # the confirm step (keep / send / unclear / failing question call) and withNotes alone
 cd ankify_logseq && /usr/bin/python3 -m unittest discover tests/unit && cd ..       # 46 tests, no Anki
 cd switching-from-roam-to-logseq && /usr/bin/python3 -m unittest discover tests && cd ..   # converter round trip
 cd ankify_logseq && /usr/bin/python3 -m unittest tests.integration.test_anki   # end to end in the Anki profile "ankify_test" (Anki open)
@@ -121,7 +138,8 @@ tail -f ~/Library/Logs/logseq-backup.log
 launchctl bootout gui/$(id -u)/com.elityre.logseq-backup     # stop
 
 # LLM inbox: forward records that Roam/Logseq kept in the browser to the shared inbox
-# (command palette → "… copy LLM inbox records" copies JSON lines to the clipboard first)
+# (command palette → "… copy LLM inbox records" copies JSON lines to the clipboard first; stops and notes
+# alike: a note line carries "halts": false, is filed as a note and makes `report` exit 0, a stop exits 3)
 pbpaste | while IFS= read -r line; do printf '%s' "$line" | python3 ~/Documents/agent-coding/shared/llm_contact.py report; done
 llm-inbox list
 # audit what the confirm step did not send (command palette → "… copy unconfirmed LLM messages");
@@ -163,4 +181,7 @@ cd switching-from-roam-to-logseq && python3 -m roam2logseq.convert EXPORT.json ~
 - The confirm step is limited to models it was measured on and passed (`CONFIRM_MODELS` in `shared/llm_contact.py`; see the shared README's Gotchas for the numbers): Haiku 5.5 and Opus 5 dropped real "I want to stop" messages when asked, Sonnet 5 dropped some, and Sonnet 5.5 / Opus 5.5 / Fable 5.2 reject a forced `tool_choice`. To change the list, edit it there and rebuild here. With the default `claude-opus-5-5` nothing is ever questioned.
 - The question call forces a tool and turns thinking off for that one call; if the API rejects it, the call fails and the original message is sent (console: "confirm step FAILED"). The browser-side question call has not been tried against the live API (2026-11-10), and neither has running these two features on `claude-haiku-4-5` at all: they send `output_config.effort` and (chat) the `web_search_20260209` tool, which that model may not accept.
 - The stores for unconfirmed messages are per origin like the records: one for Roam, one per Logseq plugin. Read them now and then (the shared README explains why: a real request phrased as a question about the task can land there).
+- `note_to_eli` has only been run against fake responses (2026-11-20, built at night with the API blocked). Not yet seen with a real model: whether the API accepts the continued request (the assistant turn is rebuilt from the stream as text plus the tool call, without thinking or web-search blocks, the same shape the confirm step sends), what Claude writes after the acknowledgement in a chat reply that was already complete (it may add a line), and whether a real objection ever goes to the note tool instead of `contact_eli` (the shared README's Gotchas ask for that to be measured).
+- When a note round runs out (3 notes in a row) or a note arrives in the answer given after a confirm-step "keep working", the note is still recorded but its call is not answered; the response is then used as it is (Auto-anki fails with "did not return valid JSON" if it holds no answer).
+- The stored LLM inbox records are never marked forwarded or removed, so "copy LLM inbox records" copies all of the last 50 every time and forwarding twice files them twice.
 - The shared helper `python3 shared/llm_contact.py check` exits 3 when a message was recorded; the browser-side `LlmContact.check()` returns the record instead. Both mean the same: stop the task, do not retry.

@@ -16,11 +16,14 @@
  * Logseq keeps everything in the plugin settings (~/.logseq/settings/logseq-claude-in-logseq.json).
  * Logs: the browser / Logseq developer console, prefixed "[claude-in-roam]" or "[claude-in-logseq]";
  * errors are also written into the graph where the reply would have gone. Every system prompt
- * starts with the shared preamble and every call carries the contact_eli tool (llm-contact.js,
- * loaded before this file); when Claude uses either, the turn stops and the message is written to
+ * starts with the shared preamble and every call carries the contact_eli and note_to_eli tools
+ * (llm-contact.js, loaded before this file). When Claude calls contact_eli or writes an "@ELI:" line,
+ * the turn stops and the message is written to
  * the graph page "llm-inbox" and kept in localStorage ("llm-inbox:records"). A contact_eli call
  * is first put to the model as one question (send, or it was a remark about the task and keep
  * working: LlmContact.withConfirm); what it chooses not to send is kept in "llm-inbox:unconfirmed".
+ * A note_to_eli call stops nothing: the note is kept in the same two places, marked as a note, the
+ * call is acknowledged and Claude is asked again, so the reply carries on (LlmContact.withNotes).
  */
 (function (root) {
   const contact = () => { if (!root.LlmContact) throw new Error("llm-contact.js is not loaded (rebuild: claude-chat/build.sh)"); return root.LlmContact; };
@@ -171,7 +174,7 @@ FORMAT (strict, the reply is written into outliner blocks):
     };
     body.tools = [];
     if (webSearch) body.tools.push({ type: "web_search_20260209", name: "web_search", max_uses: 5 });
-    body.tools.push(contact().CONTACT_TOOL); // the preamble promises Claude a way to reach Eli
+    body.tools.push(...contact().CONTACT_TOOLS); // the preamble promises Claude a way to reach Eli: contact_eli (stops the turn) and note_to_eli (does not)
     const request = { model: body.model, system: systemText, messages, tools: body.tools };
     // The confirm question (decide): same model, system and tools plus a forced choice. Short, so not
     // streamed; no effort and no thinking, because a forced tool cannot be combined with thinking.
@@ -200,7 +203,7 @@ FORMAT (strict, the reply is written into outliner blocks):
   /**
    * Read the SSE stream. Returns { text, usage, stop, content }: text is every text block
    * joined (streamed to onText as it arrives); content is the text plus any client tool calls
-   * (only contact_eli is offered), rebuilt from their input_json_delta pieces.
+   * (only contact_eli and note_to_eli are offered), rebuilt from their input_json_delta pieces.
    */
   async function readSse(res, onText) {
     const reader = res.body.getReader();
@@ -255,6 +258,21 @@ FORMAT (strict, the reply is written into outliner blocks):
     if (adapter.notify) { try { adapter.notify(`Claude asked to reach Eli: ${rec.message.slice(0, 200)} (recorded on ${cfg.inboxPage || C.INBOX_PAGE})`, "warning"); } catch (e) {} }
     console.warn("[claude-chat] contact recorded", rec.id, rec.message);
     return rec;
+  }
+
+  /**
+   * Notes Claude left for Eli (note_to_eli). LlmContact.withNotes has already recorded and answered them and
+   * the turn carries on; this puts each one on the graph page "llm-inbox" and tells the user, quietly.
+   */
+  async function showNotes(adapter, cfg, notes) {
+    const C = contact(), inbox = cfg.inboxPage || C.INBOX_PAGE;
+    for (const rec of notes) {
+      const page = C.pageBlocks(rec);
+      try {
+        if (adapter.appendToPage) { const uid = await adapter.appendToPage(inbox, page.text); for (const c of page.children) await adapter.createBlock(uid, c, { last: true }); }
+      } catch (e) { console.error("[claude-chat] could not write to the inbox page", e); }
+      if (adapter.notify) { try { adapter.notify(`Claude left Eli a note (recorded on ${inbox}; the reply carries on): ${rec.message.slice(0, 200)}`, "info"); } catch (e) {} }
+    }
   }
 
   // ---------- outline writer: streamed markdown -> blocks, as the lines arrive ----------
@@ -401,16 +419,21 @@ FORMAT (strict, the reply is written into outliner blocks):
       const systemText = contact().systemPrompt(cfg.systemText || system(cfg));
       const call = (m, decide) => streamClaude({ apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, systemText, messages: m, webSearch: cfg.webSearch !== false, maxTokens: cfg.maxTokens, fetchImpl: cfg.fetchImpl, onText: (t) => writer.push(t), decide });
       const first = await call(messages, false);
+      // A note_to_eli call does not stop the turn: the note is recorded, the call is answered and Claude is
+      // asked again (at most 3 times); what it says next streams into the same reply (after ending any
+      // half-written line). A reply that also asks for Eli comes back untouched and stops below.
+      const noted = await contact().withNotes({ app: cfg.app || settings.app, model: first.request.model, system: systemText, messages, response: first, tools: first.request.tools, call: (m) => { writer.push("\n"); return call(m, false); } });
+      await showNotes(adapter, cfg, noted.notes);
       // A contact_eli call is put to Claude as one question before anything is recorded (only for the
-      // models LlmContact.confirmApplies lists; otherwise `first` comes straight back). "Keep working":
+      // models LlmContact.confirmApplies lists; otherwise the response comes straight back). "Keep working":
       // the answer streams into the same reply (after ending any half-written line). Anything else,
-      // errors included, hands back `first` unchanged and afterResponse records it.
-      const r = (await contact().withConfirm({ app: cfg.app || settings.app, model: first.request.model, messages, response: first, call: (m, decide) => { if (!decide) writer.push("\n"); return call(m, decide); } })).response;
+      // errors included, hands back the response unchanged and afterResponse records it.
+      const r = (await contact().withConfirm({ app: cfg.app || settings.app, model: first.request.model, messages: noted.messages, response: noted.response, call: (m, decide) => { if (!decide) writer.push("\n"); return call(m, decide); } })).response;
       const w = await writer.finish();
       const rec = await afterResponse(adapter, cfg, r, replyUnder);
       // leave the cursor at the end of the reply (the adapter may decline, e.g. if the user is typing elsewhere)
       if (!rec && cfg.focusAfterReply !== false && adapter.focusBlock && w.uids.length) { try { await adapter.focusBlock(w.uids[w.uids.length - 1], true); } catch (e) { console.warn("[claude-chat] focus", e); } }
-      return { blocks: w.count, usage: r.usage, stop: r.stop, text: r.text, lastUid: w.uids[w.uids.length - 1] || null, contact: rec };
+      return { blocks: w.count, usage: r.usage, stop: r.stop, text: r.text, lastUid: w.uids[w.uids.length - 1] || null, contact: rec, notes: noted.notes };
     } catch (e) {
       // leave the error where the reply would have been, so a failure is never silent
       try { if (writer) await writer.fail(e.message); else await adapter.createBlock(replyUnder, "Error: " + e.message, { last: true }); } catch (e2) {}
@@ -470,7 +493,7 @@ FORMAT (strict, the reply is written into outliner blocks):
 
   root.ClaudeChatCore = {
     settings, norm, outline, prune, isConversation, slashTriggerAt, pageTriggerIn, stripTrigger, header, isMarker,
-    system, contextMessage, buildMessages, streamClaude, readSse, afterResponse, parseLine, makeWriter,
+    system, contextMessage, buildMessages, streamClaude, readSse, afterResponse, showNotes, parseLine, makeWriter,
     surroundings, respond, start, followUp, isFollowUpCandidate, isLockedReply, isLockedBlock, isBusy: (uid) => busy.has(uid),
   };
 })(typeof window !== "undefined" ? window : globalThis);

@@ -309,7 +309,7 @@ function main() {
   logseq.App.registerCommandPalette({ key: "auto-anki-make-here", label: "Auto-anki: make cards here" }, () => makeCardsHere(null));
   logseq.Editor.registerBlockContextMenuItem("Auto-anki: make cards here", (ctx) => makeCardsHere(ctx));
   logseq.App.registerCommandPalette({ key: "auto-anki-open-examples", label: "Auto-anki: open examples" }, () => adapter.openPage(S().examplesPage || "auto-anki/examples"));
-  // records kept in this plugin's storage when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  // records kept in this plugin's storage when Claude asked for Eli or left him a note (note_to_eli; marked halts: false); paste into `llm_contact.py report` (README)
   logseq.App.registerCommandPalette({ key: "auto-anki-copy-inbox", label: "Auto-anki: copy LLM inbox records" }, async () => {
     const r = await globalThis.LlmContact.copyRecords();
     logseq.UI.showMsg(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this plugin", "info");

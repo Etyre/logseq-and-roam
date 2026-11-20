@@ -10,11 +10,17 @@ Shared implementation of the "Auto-anki blocks" feature for Roam and Logseq.
   command palette). `build.sh` concatenates core + adapter into `../roam/auto-anki.js`.
 - `../logseq-plugins/auto-anki/` — Logseq plugin; `build.sh` copies `core.js` there.
 - `test_core.js` — `node auto-anki/test_core.js` runs the core against a fake graph and
-  a fake Claude (including a `contact_eli` call and an `@ELI:` line, which must write no cards, and
-  the confirm step: keep working, send, and a failing question call).
-- `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and `contact_eli` tool, baked in
-  by `build.sh`; the preamble precedes the prompt (built-in or from `auto-anki/prompt`) on every
-  call. When Claude uses either channel the run stops without touching the cards, the message goes
+  a fake Claude (including a `contact_eli` call and an `@ELI:` line, which must write no cards, the
+  confirm step: keep working, send, and a failing question call; and `note_to_eli` calls, after which
+  the cards are still written and the note is recorded once).
+- `../llm-contact/llm-contact.js` — the shared LLM-inbox preamble and the `contact_eli` and
+  `note_to_eli` tools, baked in by `build.sh`; the preamble precedes the prompt (built-in or from
+  `auto-anki/prompt`) on every call. A `note_to_eli` call (added 2026-11-20) does not stop the run
+  and is never read as the answer: the note goes to the page `llm-inbox` and to the records (marked
+  `via: "note", halts: false`) with an info notice, the call is answered with the shared
+  acknowledgement, any cards that had streamed are removed and the model is asked for the JSON answer
+  again (at most 3 times). If the response already holds a complete JSON answer next to the note, that
+  answer is used and nothing more is asked. When Claude calls `contact_eli` or writes an `@ELI:` line the run stops without touching the cards, the message goes
   to the graph page `llm-inbox` and the full record to localStorage ("Auto-anki: copy LLM inbox
   records" exports it; see the top-level README). For a model on the shared confirm list (today only
   `claude-haiku-4-5`; not the default `claude-opus-5-5`, whose calls are sent unasked) a `contact_eli`

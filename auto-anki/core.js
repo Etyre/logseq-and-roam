@@ -23,7 +23,9 @@
  * (~/.logseq/settings/logseq-auto-anki.json). The prompt and the examples live in the graph
  * (pages auto-anki/prompt and auto-anki/examples). Logs: the browser / Logseq developer console,
  * prefixed "[auto-anki]". Every system prompt starts with the shared preamble and every call
- * carries the contact_eli tool (llm-contact.js, loaded before this file); when Claude uses
+ * carries the contact_eli and note_to_eli tools (llm-contact.js, loaded before this file; a note_to_eli
+ * call stops nothing: the note is kept on "llm-inbox" and in the records, marked as a note, the call is
+ * acknowledged and the model is asked again, LlmContact.withNotes); when Claude uses
  * either, the run stops without touching the cards and the message is written to the graph
  * page "llm-inbox" and kept in localStorage ("llm-inbox:records"). A contact_eli call is first put
  * to the model as one question (send, or it was a remark about the task: LlmContact.withConfirm);
@@ -573,6 +575,10 @@ MAINTENANCE
    * is sent unasked): if it says the call was a remark
    * about the task, the answer is asked for again (onRestart first, so the caller can drop what the first
    * attempt streamed) and what it had said is kept as unconfirmed; otherwise the caller stops as before.
+   * A note_to_eli call never stops the run and is never the answer (LlmContact.withNotes, before the confirm
+   * step): the note is recorded, the call answered, and the model asked again (onRestart first), at most 3
+   * times. One exception to asking again: a response that leaves a note next to a complete JSON answer is
+   * taken as the answer, because a second answer would replace the first, possibly with less.
    */
   async function callClaude({ apiKey, model, effort, system, user, fetchImpl, onText, onRestart }) {
     const f = fetchImpl || root.fetch.bind(root);
@@ -581,7 +587,7 @@ MAINTENANCE
       model: model || "claude-opus-5-5",
       system: (Array.isArray(system) ? system : [system]).filter(Boolean),
       messages: [{ role: "user", content: user }],
-      tools: [C.CONTACT_TOOL], // the preamble promises Claude a way to reach Eli
+      tools: C.CONTACT_TOOLS.slice(), // the preamble promises Claude a way to reach Eli: contact_eli (stops the run) and note_to_eli (does not)
     };
     const send = async (messages, decide) => {
       const body = {
@@ -623,15 +629,30 @@ MAINTENANCE
     };
     const first = await send(request.messages, false);
     const app = settings.app || "auto-anki";
-    // any error or unclear answer in the confirm step hands back `first` unchanged, so check() records it
-    const confirmed = await C.withConfirm({ app, model: request.model, messages: request.messages, response: first, call: async (m, decide) => { if (!decide && onRestart) await onRestart(); return send(m, decide); } });
+    const textOf = (d) => (d.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+    const answered = (d) => { try { parseJson(textOf(d)); return true; } catch (e) { return false; } };
+    const noted = await C.withNotes({ app, model: request.model, system: request.system, messages: request.messages, response: first, tools: request.tools, answered, call: async (m) => { if (onRestart) await onRestart(); return send(m, false); } });
+    // any error or unclear answer in the confirm step hands back the response unchanged, so check() records it
+    const confirmed = await C.withConfirm({ app, model: request.model, messages: noted.messages, response: noted.response, call: async (m, decide) => { if (!decide && onRestart) await onRestart(); return send(m, decide); } });
     const data = confirmed.response;
     request.messages = confirmed.messages;
     // Claude asked for Eli (contact_eli call or an "@ELI:" line): no result, the caller stops
     const rec = C.check({ app, model: request.model, system: request.system, messages: request.messages, response: data, tools: request.tools });
-    if (rec) return { contact: rec, usage: data.usage, model: data.model, request };
-    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-    return { result: parseJson(text), usage: data.usage, model: data.model, request };
+    if (rec) return { contact: rec, notes: noted.notes, usage: data.usage, model: data.model, request };
+    return { result: parseJson(textOf(data)), notes: noted.notes, usage: data.usage, model: data.model, request };
+  }
+
+  /** Notes Claude left for Eli (note_to_eli), already recorded and answered: put each on the page "llm-inbox" and tell the user, quietly. The run carries on. */
+  async function showNotes(adapter, notes) {
+    const C = contact();
+    const page = settings.inboxPage || C.INBOX_PAGE;
+    for (const rec of notes) {
+      const blocks = C.pageBlocks(rec);
+      try {
+        if (adapter.appendToPage) { const uid = await adapter.appendToPage(page, blocks.text); for (const c of blocks.children) await adapter.createBlock(uid, c, { last: true }); }
+      } catch (e) { console.error("[auto-anki] could not write to the inbox page", e); }
+      if (adapter.notify) { try { adapter.notify(`Claude left Eli a note (recorded on ${page}; the cards are still being written): ${rec.message.slice(0, 200)}`, "info"); } catch (e) {} }
+    }
   }
 
   /** Record a contact in the graph (page "llm-inbox") and tell the user; the run stops after this. */
@@ -830,6 +851,7 @@ MAINTENANCE
         if (streamError) throw streamError;
       } catch (e) { await queue; await rollback(); throw e; }
       const { result, usage, contact: rec } = call;
+      await showNotes(adapter, call.notes);
       if (rec) { await rollback(); await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
       // what streamed in exists now: give the planner those uids so it leaves the blocks alone
       for (const [uid, title] of live.made) groupIndex.set(uid, { uid, text: title, notes: [], groups: [] });
@@ -926,7 +948,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, cardText, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
+    ensureAnkifyTag, cardText, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, showNotes, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);

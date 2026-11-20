@@ -83,7 +83,7 @@ const adapter = {
     const props = cur ? splitProps(cur.content).props : [];
     await logseq.Editor.updateBlock(uid, props.length ? text + "\n" + props.join("\n") : text);
   },
-  // the LLM inbox page: where a contact_eli call or an "@ELI:" line is recorded
+  // the LLM inbox page: where a contact_eli call, an "@ELI:" line or a note_to_eli message is recorded
   async appendToPage(title, text) {
     let page = await logseq.Editor.getPage(title);
     if (!page) page = await logseq.Editor.createPage(title, {}, { redirect: false, createFirstBlock: false, journal: false });
@@ -252,7 +252,7 @@ function main() {
   logseq.Editor.registerSlashCommand("claude", onSlash);
   logseq.App.registerCommandPalette({ key: "claude-in-logseq-ask", label: "Claude in Logseq: ask here" }, () => askHere(null));
   logseq.Editor.registerBlockContextMenuItem("Claude in Logseq: ask here", (ctx) => askHere(ctx));
-  // records kept in this plugin's storage when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  // records kept in this plugin's storage when Claude asked for Eli or left him a note (note_to_eli; marked halts: false); paste into `llm_contact.py report` (README)
   logseq.App.registerCommandPalette({ key: "claude-in-logseq-copy-inbox", label: "Claude in Logseq: copy LLM inbox records" }, async () => {
     const r = await globalThis.LlmContact.copyRecords();
     logseq.UI.showMsg(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this plugin", "info");

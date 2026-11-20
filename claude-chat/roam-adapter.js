@@ -91,7 +91,7 @@
       return uid;
     },
     async updateBlock(uid, text) { await api.data.block.update({ block: { uid, string: text } }); },
-    // the LLM inbox page: where a contact_eli call or an "@ELI:" line is recorded
+    // the LLM inbox page: where a contact_eli call, an "@ELI:" line or a note_to_eli message is recorded
     async appendToPage(title, text) {
       let p = api.pull("[:block/uid]", [":node/title", title]);
       if (!p) { const uid = api.util.generateUID(); await api.data.page.create({ page: { title, uid } }); p = { ":block/uid": uid }; }
@@ -303,7 +303,7 @@
   api.ui.commandPalette.addCommand({ label: "Claude in Roam: ask here", callback: askHere });
   api.ui.commandPalette.addCommand({ label: "Claude in Roam: set API key", callback: askKey });
   api.ui.commandPalette.addCommand({ label: "Claude in Roam: toggle reply lock", callback: () => { lockEnabled = !lockEnabled; toast(`Claude in Roam: replies ${lockEnabled ? "locked" : "unlocked"}`, "info"); } });
-  // records kept in this browser when Claude asked for Eli; paste into `llm_contact.py report` (README)
+  // records kept in this browser when Claude asked for Eli or left him a note (note_to_eli; marked halts: false); paste into `llm_contact.py report` (README)
   api.ui.commandPalette.addCommand({ label: "Claude in Roam: copy LLM inbox records", callback: async () => {
     const r = await window.LlmContact.copyRecords();
     toast(r.count ? `${r.count} LLM inbox record(s) ${r.copied ? "copied as JSON lines" : "printed to the console (clipboard unavailable)"}` : "No LLM inbox records in this browser", "info");

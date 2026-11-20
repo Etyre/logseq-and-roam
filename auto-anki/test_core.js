@@ -11,6 +11,12 @@ const LlmContact = globalThis.LlmContact;
 const SHARED = path.join(process.env.HOME, "Documents/agent-coding/shared");
 assert.strictEqual(LlmContact.PREAMBLE, fs.readFileSync(path.join(SHARED, "llm-system-prompt-preamble.md"), "utf8").trim(), "llm-contact.js is stale: run llm-contact/build.sh");
 assert.deepStrictEqual(LlmContact.CONTACT_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "contact_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.NOTE_TOOL, JSON.parse(fs.readFileSync(path.join(SHARED, "note_to_eli_tool.json"), "utf8")), "llm-contact.js is stale: run llm-contact/build.sh");
+// the acknowledgement that answers a note_to_eli call is defined in llm_contact.py only
+const noteResult = /^NOTE_RESULT_TEXT = (".*")\s*$/m.exec(fs.readFileSync(path.join(SHARED, "llm_contact.py"), "utf8"));
+assert.ok(noteResult, "NOTE_RESULT_TEXT is no longer a one-line string in shared/llm_contact.py: update this test");
+assert.strictEqual(LlmContact.NOTE_RESULT_TEXT, JSON.parse(noteResult[1]), "llm-contact.js is stale: run llm-contact/build.sh");
+assert.deepStrictEqual(LlmContact.CONTACT_TOOLS, [LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL]);
 assert.ok(LlmContact.systemPrompt("rules").startsWith(LlmContact.PREAMBLE + "\n\nrules"));
 
 // ----- state / reconcile -----
@@ -123,7 +129,7 @@ assert.strictEqual(core.tagAsHome("x #[[LLM-generated cards]]"), "x #[[LLM-gener
     userMessages.push(body.messages[0].content);
     assert.ok(body.output_config.format.type === "json_schema");
     assert.strictEqual(body.system[0].text, LlmContact.systemPrompt(promptPage ? "custom prompt" : core.SYSTEM), "shared preamble first, then the (prompt page or built-in) prompt");
-    assert.deepStrictEqual(body.tools, [LlmContact.CONTACT_TOOL], "contact_eli offered on every call");
+    assert.deepStrictEqual(body.tools, [LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL], "contact_eli and note_to_eli offered on every call");
     if (calls === 1) promptPage = [{ text: "custom prompt", children: [] }];
     assert.ok(opts.headers["anthropic-dangerous-direct-browser-access"] === "true");
     const a = answers.shift();
@@ -267,7 +273,7 @@ async function contactTests() {
   const recs = LlmContact.records();
   assert.strictEqual(recs.length, 2, "full records kept locally");
   assert.ok(recs[0].system[0].startsWith(LlmContact.PREAMBLE) && recs[0].messages.length === 1 && recs[0].response.content[0].name === "contact_eli", "record carries system, messages, response, tools");
-  assert.deepStrictEqual(recs[0].tools, [LlmContact.CONTACT_TOOL]);
+  assert.deepStrictEqual(recs[0].tools, [LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL]);
   assert.strictEqual(LlmContact.exportJsonl().split("\n").length, 2);
   // the tool call was questioned once (same model and system, forced choice, no JSON format, no thinking); the @ELI: line never
   assert.strictEqual(decisions.length, 1);
@@ -276,7 +282,7 @@ async function contactTests() {
   assert.deepStrictEqual(dq.system, bodies[0].system);
   assert.deepStrictEqual(dq.thinking, { type: "disabled" });
   assert.deepStrictEqual(dq.tool_choice, { type: "tool", name: "contact_eli_decision" });
-  assert.deepStrictEqual(dq.tools, [LlmContact.CONTACT_TOOL, LlmContact.CONFIRM.decision_tool]);
+  assert.deepStrictEqual(dq.tools, [LlmContact.CONTACT_TOOL, LlmContact.NOTE_TOOL, LlmContact.CONFIRM.decision_tool]);
   assert.deepStrictEqual(dq.messages.slice(1), [
     { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "contact_eli", input: { message: "I would rather not write cards from this material." } }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: LlmContact.CONFIRM.question }] },
@@ -333,6 +339,74 @@ async function contactTests() {
     assert.deepStrictEqual(g7.H.children, []);
     assert.ok(LlmContact.records().length === 4 && LlmContact.unconfirmed().length === 1);
   }
+  // ----- note_to_eli: the note is delivered once, the call is answered, and the run carries on -----
+  const note = (message, id) => ({ type: "tool_use", id, name: "note_to_eli", input: { message } });
+  // a response that is only the note: one more call, then the cards as usual
+  {
+    const { g: g8, adapter: ad8 } = fakeGraph();
+    const pages8 = {}; // this graph's own inbox page, so the entry's child blocks can be read back
+    ad8.appendToPage = async (title, text) => { if (!pages8[title]) { const uid = "pg_" + title; g8[uid] = { uid, text: "", children: [] }; pages8[title] = uid; } return ad8.createBlock(pages8[title], text, { last: true }); };
+    ad8.notify = adapter.notify;
+    responses.push({ content: [note("The source gives two different years for the same event.", "tn1")], usage: {}, stop_reason: "tool_use" }, { content: [cards(["n1 {c1:y}", "n2 {c1:z}"])], usage: {}, stop_reason: "end_turn" });
+    const seen = notices.length, sent = bodies.length, asked = decisions.length;
+    const r8 = await quiet(() => core.runUpdate(ad8, "H", cfg));
+    assert.ok(!r8.contact && r8.created === 2, "a note does not stop the run: " + JSON.stringify(r8));
+    const texts = g8.H.children.map((c) => g8[c].text);
+    assert.ok(texts.length === 3 && texts[0] === "n1 {c1:y}" && texts[1] === "n2 {c1:z}" && core.isStateBlock(texts[2]), "the cards are written, and the note is not one of them");
+    assert.strictEqual(bodies.length, sent + 2, "one more call after the note");
+    assert.strictEqual(decisions.length, asked, "a note is never questioned");
+    const cont = bodies[bodies.length - 1];
+    assert.ok(!cont.tool_choice && cont.stream === true && cont.output_config.format, "the continued call is an ordinary one");
+    assert.deepStrictEqual(cont.messages.slice(1), [
+      { role: "assistant", content: [note("The source gives two different years for the same event.", "tn1")] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tn1", content: LlmContact.NOTE_RESULT_TEXT }] },
+    ]);
+    assert.strictEqual(LlmContact.records().length, 5, "the note is recorded once");
+    const rec = LlmContact.records()[4];
+    assert.deepStrictEqual([rec.type, rec.via, rec.halts, rec.message, rec.app, rec.model], ["contact", "note", false, "The source gives two different years for the same event.", "auto-anki", "claude-haiku-4-5"]);
+    assert.ok(rec.system[0].startsWith(LlmContact.PREAMBLE) && rec.messages.length === 1 && rec.response.content[0].name === "note_to_eli" && rec.tools.length === 2, "the note record carries system, messages, response, tools");
+    assert.strictEqual(g8[pages8["llm-inbox"]].children.length, 1, "one entry on the inbox page");
+    const entry = g8[g8[pages8["llm-inbox"]].children[0]];
+    assert.ok(/ · auto-anki · claude-haiku-4-5 · via note \(task carried on\)$/.test(entry.text) && g8[entry.children[0]].text === rec.message, entry.text);
+    assert.deepStrictEqual(notices.slice(seen).map((n) => n.kind), ["info"], "told quietly, no warning");
+    assert.strictEqual(LlmContact.unconfirmed().length, 1);
+  }
+  // a note next to a complete answer: the answer is used as it is (asking again could replace it), the note is recorded
+  {
+    const { g: g9, adapter: ad9 } = fakeGraph();
+    ad9.appendToPage = adapter.appendToPage; ad9.notify = adapter.notify;
+    responses.push({ content: [cards(["a1 {c1:y}"]), note("One card is all this source supports.", "tn2")], usage: {}, stop_reason: "tool_use" });
+    const sent = bodies.length;
+    const r9 = await quiet(() => core.runUpdate(ad9, "H", { ...cfg, model: undefined }));
+    assert.ok(!r9.contact && r9.created === 1 && bodies.length === sent + 1, "no second call");
+    assert.deepStrictEqual(g9.H.children.map((c) => g9[c].text).slice(0, 1), ["a1 {c1:y}"]);
+    assert.ok(LlmContact.records().length === 6 && LlmContact.records()[5].via === "note" && LlmContact.records()[5].halts === false && LlmContact.records()[5].model === "claude-opus-5-5");
+  }
+  // a note that cut the answer short: what streamed so far is dropped and the answer is asked for again
+  {
+    const { g: g10, adapter: ad10 } = fakeGraph();
+    ad10.appendToPage = adapter.appendToPage; ad10.notify = adapter.notify;
+    const partial = { type: "text", text: '{"tags": [], "notes": [{"uid": null, "text": "first attempt {c1:x}", "back": []}' };
+    responses.push({ content: [partial, note("Leaving a note half way.", "tn3")], usage: {}, stop_reason: "tool_use" }, { content: [cards(["b1 {c1:y}"])], usage: {}, stop_reason: "end_turn" });
+    const r10 = await quiet(() => core.runUpdate(ad10, "H", cfg));
+    assert.ok(!r10.contact && r10.created === 1);
+    assert.ok(!Object.values(g10).some((b) => /first attempt/.test(b.text)) && g10[g10.H.children[0]].text === "b1 {c1:y}", "the first attempt's card is gone");
+    assert.deepStrictEqual(bodies[bodies.length - 1].messages[1].content[0], partial);
+    assert.strictEqual(LlmContact.records().length, 7);
+  }
+  // a note and a contact_eli call in one response: both recorded, and the run stops
+  {
+    const { g: g11, adapter: ad11 } = fakeGraph();
+    ad11.appendToPage = adapter.appendToPage; ad11.notify = adapter.notify;
+    responses.push({ content: [note("For later: the prompt page is long.", "tn4"), { type: "tool_use", id: "tu4", name: "contact_eli", input: { message: "Please stop here." } }], usage: {}, stop_reason: "tool_use" });
+    const sent = bodies.length;
+    const r11 = await quiet(() => core.runUpdate(ad11, "H", { ...cfg, model: undefined }));
+    assert.ok(r11.contact && r11.contact.via === "tool" && r11.contact.message === "Please stop here." && r11.contact.halts === undefined && bodies.length === sent + 1);
+    assert.deepStrictEqual(g11.H.children, []);
+    assert.deepStrictEqual(LlmContact.records().slice(7).map((r) => [r.via, r.halts, r.message]), [["note", false, "For later: the prompt page is long."], ["tool", undefined, "Please stop here."]]);
+    assert.strictEqual(notices[notices.length - 1].kind, "warning");
+  }
+  assert.strictEqual(responses.length, 0);
   delete globalThis.localStorage;
   console.log("contact tests OK");
 }
