@@ -43,7 +43,34 @@ const notes = [noteA, { uid: "b", text: "Q: why? #ankify", children: [{ uid: "b1
 const s2 = core.emptyState(); s2.frozen = ["a"];
 const ops = core.plan(result, notes, s2, "ankify");
 assert.strictEqual(ops.updates.length, 1); assert.strictEqual(ops.updates[0].uid, "b"); assert.strictEqual(ops.updates[0].text, "Q: why? #ankify");
-assert.strictEqual(ops.creates.length, 1); assert.strictEqual(ops.creates[0].text, "{c1:Anki} syntax #ankify");
+assert.strictEqual(ops.creates.length, 1); assert.strictEqual(ops.creates[0].text, "{c1:Anki} syntax");
+// new cards carry no ankify tag by default (the user tags the ones they want); tagCards restores the old behaviour
+assert.strictEqual(core.plan(result, notes, s2, "ankify", undefined, true).creates[0].text, "{c1:Anki} syntax #ankify");
+assert.strictEqual(core.cardText("{{c1::x}} y #ankify", "ankify", false), "{c1:x} y", "a tag the model wrote anyway is dropped");
+{ // tagging or untagging a card is approval, not an edit: it never freezes the card
+  const st = core.emptyState();
+  st.notes.t = { hash: core.fingerprint({ text: "Fact {c1:x}", children: [] }) };
+  assert.deepStrictEqual(core.reconcile(st, [{ uid: "t", text: "Fact {c1:x} #ankify", children: [] }]).changed, false);
+  assert.deepStrictEqual(st.frozen, []);
+  assert.strictEqual(core.reconcile(st, [{ uid: "t", text: "Fact {c1:x}, edited #ankify", children: [] }]).changed, true, "a real edit still freezes");
+  // state written before 2026-11-20 hashed the text with its tag: still recognised, tagged or not
+  const old = core.emptyState();
+  old.notes.o = { hash: core.hash("Old {c1:y} #ankify\n") };
+  core.reconcile(old, [{ uid: "o", text: "Old {c1:y} #ankify", children: [] }]); assert.deepStrictEqual(old.frozen, []);
+  core.reconcile(old, [{ uid: "o", text: "Old {c1:y}", children: [] }]); assert.deepStrictEqual(old.frozen, [], "untagging an old card is not an edit either");
+}
+{ // without tags, the state block tells cards from headings
+  const st = core.emptyState(); st.notes.c1 = { hash: "x" }; st.notes.c2 = { hash: "x" };
+  const kids = [
+    { uid: "hd", text: "Heading", children: [{ uid: "c1", text: "untagged fact {c1:x}", children: [] }] },
+    { uid: "c2", text: "Untagged question?", children: [{ uid: "a", text: "answer", children: [] }] },
+    { uid: "mine", text: "My question?", children: [{ uid: "a2", text: "my answer", children: [] }] },
+    { uid: "st", text: core.serializeState(st), children: [] },
+  ];
+  const sp = core.splitChildren(kids, "ankify", "H");
+  assert.deepStrictEqual(sp.groups.map((x) => x.uid), ["hd"], "a block above a recorded card is a heading");
+  assert.deepStrictEqual(sp.notes.map((x) => x.uid), ["c1", "c2", "mine"], "question blocks with answers stay cards");
+}
 assert.deepStrictEqual(ops.deletes, [], "frozen or just-updated notes are never deleted");
 assert.deepStrictEqual(ops.tags, ["geography", "france"]);
 
@@ -110,7 +137,7 @@ assert.strictEqual(core.tagAsHome("x #[[LLM-generated cards]]"), "x #[[LLM-gener
   const r1 = await core.runUpdate(adapter, "H", cfg);
   assert.deepStrictEqual([r1.created, r1.updated, r1.deleted], [2, 0, 0]);
   assert.strictEqual(g.H.text, "#[[auto-generate cards]] #physics");
-  assert.strictEqual(g.n1.text, "Water boils at {c1:100 C} at sea level #ankify");
+  assert.strictEqual(g.n1.text, "Water boils at {c1:100 C} at sea level");
   assert.deepStrictEqual(g.n2.children.map((c) => g[c].text), ["lower pressure"]);
   const stateUid = g.H.children[g.H.children.length - 1];
   assert.ok(core.isStateBlock(g[stateUid].text), "state block is the last child");
@@ -138,7 +165,7 @@ assert.strictEqual(core.tagAsHome("x #[[LLM-generated cards]]"), "x #[[LLM-gener
   const r2 = await core.runUpdate(adapter, "H", cfg);
   assert.deepStrictEqual([r2.created, r2.updated, r2.deleted], [0, 1, 0], "frozen n2 survives the delete request");
   assert.ok(g.n2, "frozen note kept");
-  assert.strictEqual(g.n1.text, "Water boils at {c1:100 C} at {c2:sea level} #ankify");
+  assert.strictEqual(g.n1.text, "Water boils at {c1:100 C} at {c2:sea level}");
   assert.strictEqual(g.H.text, "#[[auto-generate cards]] #physics #water");
   assert.strictEqual(g.H.children.indexOf(stateUid), g.H.children.length - 1, "state block still last");
   ref = await core.refresh(adapter, "H");
@@ -271,7 +298,7 @@ async function contactTests() {
     const r5 = await quiet(() => core.runUpdate(ad5, "H", cfg));
     assert.ok(!r5.contact && r5.created === 2, JSON.stringify(r5));
     const texts = g5.H.children.map((c) => g5[c].text);
-    assert.deepStrictEqual(texts.slice(0, 2), ["k1 {c1:y} #ankify", "k2 {c1:z} #ankify"]);
+    assert.deepStrictEqual(texts.slice(0, 2), ["k1 {c1:y}", "k2 {c1:z}"]);
     assert.ok(texts.length === 3 && core.isStateBlock(texts[2]) && !Object.values(g5).some((b) => /first attempt/.test(b.text)), "the first attempt's card is gone");
     assert.strictEqual(bodies.length, sent + 2);
     const cont = bodies[bodies.length - 1];
@@ -357,7 +384,7 @@ async function groupingTests() {
   assert.deepStrictEqual(kidsText("H").slice(0, 2), ["Mechanisms", "History"]);
   assert.ok(core.isStateBlock(g[g.H.children[2]].text) && g.H.children.length === 3, "headings then the state block");
   const mech = findByText("Mechanisms"), hist = findByText("History"), early = findByText("Early"), late = findByText("Late");
-  assert.deepStrictEqual(kidsText(mech.uid), ["m1 {c1:x} #ankify", "m2 {c1:x} #ankify", "m3 {c1:x} #ankify"]);
+  assert.deepStrictEqual(kidsText(mech.uid), ["m1 {c1:x}", "m2 {c1:x}", "m3 {c1:x}"]);
   assert.deepStrictEqual(kidsText(hist.uid), ["Early", "Late"]);
   assert.strictEqual(kidsText(late.uid).length, 3);
   let ref = await core.refresh(adapter, "H");
@@ -381,13 +408,13 @@ async function groupingTests() {
   r = await core.runUpdate(adapter, "H", cfg);
   assert.deepStrictEqual([r.created, r.updated, r.deleted], [0, 0, 1]);
   assert.strictEqual(g[mech.uid].text, "Mechanisms (core)");
-  assert.deepStrictEqual(kidsText(mech.uid), ["m1 {c1:x} #ankify", "m2 {c1:x} #ankify", "l3 {c1:x} #ankify"], "l3 moved into Mechanisms");
-  assert.deepStrictEqual(kidsText(late.uid), ["l1 {c1:x} #ankify", "l2 {c1:x} #ankify"]);
+  assert.deepStrictEqual(kidsText(mech.uid), ["m1 {c1:x}", "m2 {c1:x}", "l3 {c1:x}"], "l3 moved into Mechanisms");
+  assert.deepStrictEqual(kidsText(late.uid), ["l1 {c1:x}", "l2 {c1:x}"]);
   assert.ok(!g[m3.uid], "m3 deleted");
 
   // run 3: the user edits e1 (frozen); the model now returns a flat list -> editable notes go
   // to the home block, the frozen note keeps its heading, empty headings disappear
-  const e1 = findByText("e1"); g[e1.uid].text = "e1 edited {c1:x} #ankify";
+  const e1 = findByText("e1"); g[e1.uid].text = "e1 edited {c1:x}";
   ref = await core.refresh(adapter, "H");
   assert.deepStrictEqual(ref.state.frozen, [e1.uid]);
   const flat = ["m1", "m2", "l3", "e2", "l1", "l2"].map((t) => note(`${t} {c1:x}`, findByText(t).uid));
@@ -396,9 +423,9 @@ async function groupingTests() {
   r = await core.runUpdate(adapter, "H", cfg);
   assert.ok(!g[mech.uid] && !g[late.uid] && !g[hist.uid] && !g[early.uid], "all headings empty and removed");
   const top = kidsText("H");
-  assert.ok(top.slice(0, 7).every((t) => /#ankify$/.test(t)), "all notes back at the top level: " + top.join(" | "));
+  assert.ok(top.slice(0, 7).every((t) => /\{c1:x\}$/.test(t)), "all notes back at the top level: " + top.join(" | "));
   assert.strictEqual(top.length, 8, "seven notes + state block");
-  assert.strictEqual(g[e1.uid].text, "e1 edited {c1:x} #ankify", "frozen note moved but not rewritten or deleted");
+  assert.strictEqual(g[e1.uid].text, "e1 edited {c1:x}", "frozen note moved but not rewritten or deleted");
   assert.ok(core.isStateBlock(top[top.length - 1]), "state block still last");
   ref = await core.refresh(adapter, "H");
   assert.deepStrictEqual(Object.keys(ref.state.groups), []);
@@ -509,7 +536,7 @@ function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
     const H = g.HS.children.map((u) => g[u]);
     assert.deepStrictEqual(H.map((b) => b.text).slice(0, 3), ["Lengths", "Places", "Misc"]);
     assert.ok(core.isStateBlock(H[3].text) && H.length === 4, "state block last, nothing duplicated");
-    assert.deepStrictEqual(H[0].children.map((u) => g[u].text), ["Nile {c1:6650 km} #ankify", "Longest river? #ankify", "Amazon {c1:6400 km} #ankify"]);
+    assert.deepStrictEqual(H[0].children.map((u) => g[u].text), ["Nile {c1:6650 km}", "Longest river?", "Amazon {c1:6400 km}"]);
     assert.deepStrictEqual(g[H[0].children[1]].children.map((u) => g[u].text), ["Nile"]);
     assert.strictEqual(g[H[1].children[0]].text, "Sources"); assert.strictEqual(g[H[1].children[0]].children.length, 2);
     const state = core.parseState(H[3].text);
@@ -530,7 +557,7 @@ function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
     assert.deepStrictEqual([r2.created, r2.updated, r2.deleted], [1, 0, 1]);
     assert.strictEqual(g.HS.children.length, before, "no heading duplicated");
     assert.deepStrictEqual(g[uidOf("Lengths")].children.map((u) => g[u].text.replace(/ #ankify$/, "")), ["Nile {c1:6650 km}", "Longest river?", "Amazon {c1:6400 km}", "Congo {c1:4700 km}"]);
-    assert.deepStrictEqual(g[uidOf("Misc")].children.map((u) => g[u].text), ["m1 {c1:x} #ankify", "m2 {c1:y} #ankify"]);
+    assert.deepStrictEqual(g[uidOf("Misc")].children.map((u) => g[u].text), ["m1 {c1:x}", "m2 {c1:y}"]);
     assert.strictEqual(Object.keys(core.parseState(g[g.HS.children[g.HS.children.length - 1]].text).notes).length, 8);
   }
   // 3) the stream breaks half way: everything written so far is removed again

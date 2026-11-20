@@ -18,7 +18,8 @@ const SETTINGS = [
   { key: "apiKey", type: "string", title: "Anthropic API key", description: "Stored in the plugin settings, not in the graph.", default: "" },
   { key: "homeTags", type: "string", title: "Home tags", description: "Comma-separated page names whose tag marks a home block.", default: "auto-generate cards, LLM-generated cards" },
   { key: "offTags", type: "string", title: "Off tags", description: "Comma-separated page names; a home block carrying one of these tags is switched off. Home blocks inside a template definition (an ancestor with template::) are off automatically.", default: "auto-anki off" },
-  { key: "ankifyTag", type: "string", title: "Ankify tag", description: "Added to every generated note.", default: "ankify" },
+  { key: "ankifyTag", type: "string", title: "Ankify tag", description: "The tag that sends a block to Anki. You add it to the cards you want to keep (or switch on the next setting).", default: "ankify" },
+  { key: "tagNewCards", type: "boolean", title: "Tag new cards", description: "Off: cards are written without the ankify tag and reach Anki only once you tag them. On: every new card is tagged as it is written.", default: false },
   { key: "model", type: "string", title: "Model", description: "", default: "claude-opus-5-5" },
   { key: "effort", type: "enum", title: "Effort", enumChoices: ["low", "medium", "high", "xhigh", "max"], enumPicker: "select", description: "", default: "high" },
   { key: "extraInstructions", type: "string", title: "Extra instructions", description: "Free text sent with every request (deck, style, language…).", default: "" },
@@ -217,7 +218,7 @@ async function update(uid, quiet) {
   if (core.isBusy(uid)) return;
   decorate();
   try {
-    const run = core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
+    const run = core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, tagCards: cfg.tagNewCards, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
     decorate(); // the core marked the block busy: show the pulsing dot while Claude works
     const r = await run;
     statusCache.delete(uid);

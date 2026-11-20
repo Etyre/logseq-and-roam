@@ -7,11 +7,13 @@
  *   home block     a block tagged #[[auto-generate cards]] or [[LLM-generated cards]]
  *   content blocks the home block's siblings and all their descendants, plus the text of
  *                  the parent block they all sit under (LLM: read)
- *   notes          blocks under the home block carrying the ankify tag, in ankify_roam /
- *                  ankify_logseq format (LLM: write, except frozen notes)
+ *   notes          blocks under the home block in ankify_roam / ankify_logseq format (LLM:
+ *                  write, except frozen notes). They are written WITHOUT the ankify tag
+ *                  (unless tagCards is on): the user tags the cards they want in Anki.
+ *                  A block is known to be a card by its tag or by the state block.
  *   groups         when there are more than a few notes they sit under labelled heading
  *                  blocks (at most two levels deep); a heading is any block under the
- *                  home block without the ankify tag that has notes below it
+ *                  home block that is not a card and has cards below it
  *   state block    a hidden last child of the home block, "#auto-anki-state {json}",
  *                  holding the hash of what the LLM last wrote for every note, the set
  *                  of frozen (user-edited) notes and the content hash of the last run
@@ -97,24 +99,37 @@
 
   // ---------- notes ----------
   const backTexts = (note) => (note.children || []).map((c) => norm(c.text)).filter(Boolean);
-  const fingerprint = (note) => hash(norm(note.text) + "\n" + backTexts(note).join("\n"));
+  const rawFingerprint = (note) => hash(norm(note.text) + "\n" + backTexts(note).join("\n"));
+  // The ankify tag is the user's approval mark, not part of what the LLM wrote: adding or removing
+  // it must not count as an edit, so it is left out of the fingerprint.
+  const fingerprint = (note) => rawFingerprint({ text: stripTag(note.text, settings.ankifyTag), children: note.children });
+  /** Does the note still read as the LLM last wrote it? Also accepts hashes stored before 2026-11-20, which included the tag. */
+  const matchesRecord = (rec, n) => rec.hash === fingerprint(n) || rec.hash === rawFingerprint(n)
+    || rec.hash === rawFingerprint({ text: ensureAnkifyTag(stripTag(n.text, settings.ankifyTag), settings.ankifyTag), children: n.children });
 
   const hasTag = (text, tag) => lowerTags(text).includes(String(tag || DEFAULT_ANKIFY_TAG).toLowerCase());
-  const hasNoteBelow = (b, tag) => (b.children || []).some((c) => hasTag(c.text, tag) || hasNoteBelow(c, tag));
+  // A card is a block the user tagged or one the state block records as written by the LLM
+  // (new cards carry no tag, so the tag alone no longer tells cards from headings).
+  const isCard = (c, tag, state) => hasTag(c.text, tag) || !!(state && state.notes && state.notes[c.uid]);
+  const hasNoteBelow = (b, tag, state) => (b.children || []).some((c) => isCard(c, tag, state) || hasNoteBelow(c, tag, state));
+  const isHeading = (c, tag, state) => !isCard(c, tag, state)
+    && (hasNoteBelow(c, tag, state) || (!!(state && state.groups && state.groups[c.uid]) && (c.children || []).some((k) => norm(k.text))));
 
   /**
-   * Walk the home block's subtree: notes (blocks with the ankify tag, or tagless
-   * blocks with no notes below them), heading groups (tagless blocks with notes
-   * below) and the state block. Every note gets groupUid (null = directly under
-   * the home block); groups form a tree and are also indexed flat by uid.
+   * Walk the home block's subtree: heading groups (blocks that are not cards and
+   * have cards below them, or headings the LLM made that still hold something),
+   * notes (every other block with text or children) and the state block. Every
+   * note gets groupUid (null = directly under the home block); groups form a tree
+   * and are also indexed flat by uid.
    */
   function splitChildren(children, tag, homeUid) {
-    let stateBlock = null;
+    let stateBlock = (children || []).find((c) => isStateBlock(c.text)) || null;
+    const known = parseState(stateBlock && stateBlock.text);
     const notes = [], groups = [], groupIndex = new Map();
     const walk = (kids, parentUid, list, depth) => {
       for (const c of kids || []) {
         if (isStateBlock(c.text)) { if (!stateBlock) stateBlock = c; continue; }
-        if (!hasTag(c.text, tag) && hasNoteBelow(c, tag)) {
+        if (isHeading(c, tag, known)) {
           const g = { uid: c.uid, text: c.text, parentUid, depth, notes: [], groups: [] };
           list.push(g); groupIndex.set(c.uid, g);
           walk(c.children, c.uid, g.groups, depth + 1);
@@ -143,7 +158,7 @@
     for (const n of notes) {
       if (frozen.has(n.uid)) continue;
       const rec = state.notes[n.uid];
-      if (!rec || rec.hash !== fingerprint(n)) { frozen.add(n.uid); changed = true; }
+      if (!rec || !matchesRecord(rec, n)) { frozen.add(n.uid); changed = true; }
     }
     // LLM-written notes that no longer exist were deleted by the user
     const vanished = [];
@@ -244,6 +259,15 @@
     return text.replace(/\s+$/, "") + (/\s/.test(t) ? ` #[[${t}]]` : ` #${t}`);
   }
 
+  /**
+   * The text of a card as the tool writes it. New cards carry no ankify tag unless tagCards is
+   * on: the user tags the ones they want, and only tagged blocks reach Anki.
+   */
+  function cardText(raw, tag, tagCards) {
+    const text = stripTag(normaliseCloze(raw || "").trim(), tag);
+    return tagCards ? ensureAnkifyTag(text, tag) : text;
+  }
+
   function normaliseCloze(text) {
     // Anki's {{c1::x::hint}} -> ankify's {c1:x::hint}; never leave Anki syntax behind
     return String(text || "").replace(/\{\{c(\d+)::(.*?)\}\}/gs, (m, n, body) => `{c${n}:${body}}`);
@@ -289,7 +313,7 @@ FORMAT
 - Each flashcard is one block ("text") with optional child blocks ("back").
 - Cloze notes: the deletion goes in single curly braces with a number, e.g. "The mitochondrion produces ATP through {c1:oxidative phosphorylation}." Hint after two colons: "{c1:ATP::three letters}". Deletions with the same number are revealed together; different numbers make separate cards. Never use Anki's double-brace syntax.
 - Basic notes: "text" is the prompt and "back" holds the answer as one or more short strings (each becomes a child block). A basic note must have a non-empty back.
-- Do not put the #ankify tag or any other tag in "text"; the tool adds it. Plain text only, apart from **bold**, __underline__ and [[Page]] links.
+- Do not put the #ankify tag or any other tag in "text"; the user tags the cards they keep. Plain text only, apart from **bold**, __underline__ and [[Page]] links.
 
 WHAT TO CARD
 - The user's own distillation is the primary source. After reading, they distill what they learned into an organized tree (sections such as Distillation, Summary, Notes, compression, or simply their own paraphrases). Your main job is to break that tree into atomic facts and express each as a note. Raw quotes, transcripts and first-pass notes are secondary: take specific concrete facts from them too, but do not card their narrative.
@@ -309,6 +333,7 @@ HOW TO WRITE
   "When was Hamas founded? / In 1987." -> "When was Hamas founded? / 1987"
   "How can a copy of an object be made in JavaScript? / By spreading that object inside a new object." -> "JavaScript: how do you copy an object? / Spread it inside a new object."
   "What do I do if I want to know the value of a given prop? / Look where the component is implemented / used." -> "How do I check the value of a prop? / Look where the component is used."
+- The answer is only what the question asks for, and then it stops. Never append an explanation, reason, qualifier or related fact to it: no second clause after a semicolon, dash or "because", no second sentence. If the extra fact is worth knowing, it becomes a separate card of its own; otherwise it is dropped. The same holds for a cloze sentence: nothing after the fact being tested. Example: "Most common move for a Senate Republican chair who hits the six-year limit? / Chair a different committee where they have seniority; the clock is per committee." -> "... / Chair a different committee where they have seniority." and, as its own card, "The Senate Republican six-year chair limit is counted per {c1:committee}."
 - Open-ended prompts, never yes/no. "Was the public enthusiastic about WWII?" -> "What was the attitude of the American public towards WWII? / Determined to do what was needed, without enthusiasm or patriotic fervor." "Were wages frozen during WWII? / Yes." -> "What happened to wages during WWII? / Frozen."
 - Atomize: a complicated, multi-part fact usually becomes several separate cards. Each card must be complete and answerable on its own, with enough context in its prompt to stand alone; together the cards should cover all or most of the content of the distillation. Do not compress a compound idea into one card with a long answer.
 - Several cards per fact when they are different recall operations: "Paris is the capital of {c1:France}." and "{c1:Paris} is the capital of France." train different memories. Wherever a reversible card would help, write two cards, one in each direction (term and definition, date and event, both polarities of a relationship such as "when X rises, Y {c1:falls}" / "when X falls, Y {c1:rises}"). A cloze and a question version of the same fact are also fine when both help. Never write two cards that test the identical recall.
@@ -635,14 +660,16 @@ MAINTENANCE
    * group object ({uid|null, title, parent, notes, groups}) or null for the home block;
    * its uid is filled in when the heading is created.
    */
-  function plan(result, notes, state, ankifyTag, groupIndex) {
+  function plan(result, notes, state, ankifyTag, groupIndex, tagCards) {
     const frozen = new Set(state.frozen);
     const byUid = new Map(notes.map((n) => [n.uid, n]));
     const known = groupIndex || new Map();
     const ops = { creates: [], updates: [], deletes: [], moves: [], groups: [], tags: [] };
     const seen = new Set(), seenGroups = new Set();
     const handleNote = (raw, group) => {
-      const text = ensureAnkifyTag(normaliseCloze(raw.text || "").trim(), ankifyTag);
+      let text = cardText(raw.text, ankifyTag, tagCards);
+      // an existing card keeps the tag the user (or an earlier version) gave it
+      if (raw.uid && byUid.has(raw.uid) && hasTag(byUid.get(raw.uid).text, ankifyTag)) text = ensureAnkifyTag(text, ankifyTag);
       const back = (raw.back || []).map((b) => normaliseCloze(String(b)).trim()).filter(Boolean);
       if (!norm(text)) return;
       if (raw.uid && byUid.has(raw.uid) && frozen.has(raw.uid)) {
@@ -778,7 +805,7 @@ MAINTENANCE
       const onNote = (raw, chain) => {
         queue = queue.then(async () => {
           if (streamError || (raw.uid && existing.has(raw.uid))) return;
-          const text = ensureAnkifyTag(normaliseCloze(raw.text || "").trim(), cfg.ankifyTag);
+          const text = cardText(raw.text, cfg.ankifyTag, cfg.tagCards);
           const back = (raw.back || []).map((b) => normaliseCloze(String(b)).trim()).filter(Boolean);
           if (!norm(text)) return;
           const target = await liveHeading(chain);
@@ -810,7 +837,7 @@ MAINTENANCE
         (obj.groups || []).forEach((g, i) => { const p = [...path, "groups", i]; const uid = live.groups.get(pkey(p)); if (uid) g.uid = uid; adopt(g, p); });
       };
       adopt(result, []);
-      const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex);
+      const ops = plan(result, notes, state, cfg.ankifyTag, groupIndex, cfg.tagCards);
 
       const byUid = new Map(notes.map((n) => [n.uid, n]));
       // headings first, so every note has a parent to go to
@@ -874,7 +901,7 @@ MAINTENANCE
       for (const uid of Object.keys(state.groups || {})) {
         const b = present.get(uid);
         if (!b) { delete state.groups[uid]; continue; }
-        if (!hasTag(b.text, ankifyTag) && !hasNoteBelow(b, ankifyTag) && !(b.children || []).some((c) => norm(c.text))) {
+        if (!isCard(b, ankifyTag, state) && !hasNoteBelow(b, ankifyTag, state) && !(b.children || []).some((c) => norm(c.text))) {
           await adapter.deleteBlock(uid); delete state.groups[uid]; removed = true;
         }
       }
@@ -898,7 +925,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
+    ensureAnkifyTag, cardText, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);

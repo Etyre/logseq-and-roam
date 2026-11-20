@@ -21,6 +21,7 @@
     offTags: ["auto-anki off"], // add one of these to a home block to switch it off
     templateTags: ["roam/templates", "SmartBlock"], // home blocks under one of these (a template definition) are off
     ankifyTag: "ankify",
+    tagNewCards: false, // false: cards are written without the ankify tag and you tag the ones you want in Anki; true: every new card is tagged
     model: "claude-opus-5-5",
     effort: "high", // low | medium | high | xhigh | max
     extraInstructions: "", // free text appended to every request, e.g. deck or style preferences
@@ -244,7 +245,7 @@
     if (core.isBusy(uid)) return;
     decorate();
     try {
-      const run = core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
+      const run = core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, tagCards: CONFIG.tagNewCards, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
       decorate(); // the core marked the block busy: show the pulsing dot while Claude works
       const r = await run;
       statusCache.delete(uid);
