@@ -400,7 +400,9 @@
   const DEFAULT_ANKIFY_TAG = "ankify";
 
   // ---------- text helpers ----------
-  const norm = (s) => String(s || "").replace(/\r/g, "").split("\n").filter((l) => !/^[\w-]+::\s/.test(l)).join("\n").replace(/[ \t]+/g, " ").trim();
+  // Logseq property lines ("id:: ...") follow the block's first line and are dropped; a FIRST line of that
+  // shape is a Roam attribute ("Author:: Kissinger"), which is content (the Logseq adapter strips its own).
+  const norm = (s) => String(s || "").replace(/\r/g, "").split("\n").filter((l, i) => i === 0 || !/^[\w-]+::\s/.test(l)).join("\n").replace(/[ \t]+/g, " ").trim();
 
   function hash(str) {
     // FNV-1a 32-bit twice with different seeds -> 16 hex chars
@@ -536,7 +538,7 @@
   const day = () => new Date().toISOString().slice(0, 10);
   const stripTag = (text, tag) => {
     const t = (tag || DEFAULT_ANKIFY_TAG).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return String(text || "").replace(new RegExp(`\\s*#\\[\\[${t}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${t}(?![\\w-])`, "gi"), "").trim();
+    return String(text || "").replace(new RegExp(`\\s*#\\[\\[${t}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${t}(?![\\w/-])`, "gi"), "").trim();
   };
 
   async function writeVersion(adapter, parentUid, label, text, back, ankifyTag) {
@@ -611,6 +613,12 @@
     return out;
   }
   const contentHash = (trees) => hash(outline(trees));
+  /**
+   * Source material without other card sections: a home block deeper in the content (a sub-section with
+   * its own cards) is dropped with everything under it, state block included. Its cards restate facts that
+   * are already in the content, so sending them made duplicate cards, and the state JSON is noise.
+   */
+  const withoutHomes = (trees) => (trees || []).filter((t) => !isHome(t.text) && !isStateBlock(t.text)).map((t) => Object.assign({}, t, { children: withoutHomes(t.children) }));
 
   // ---------- ankify formatting ----------
   function ensureAnkifyTag(text, tag) {
@@ -651,7 +659,7 @@
   function tagAsHome(text) {
     const t = String(text || "").replace(/\s+$/, "");
     if (isHome(t)) return t;
-    return (t + " " + tagToken(settings.homeTags[0])).trim();
+    return (t + " " + tagToken(settings.homeTags[0] || DEFAULT_HOME_TAGS[0])).trim();
   }
 
   /** Rewrite the home block text: keep the user's words and the home tag, swap the LLM's tags. */
@@ -659,7 +667,7 @@
     let t = text || "";
     for (const tag of oldLlmTags || []) {
       const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      t = t.replace(new RegExp(`\\s*#\\[\\[${esc}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${esc}(?![\\w-])`, "gi"), "");
+      t = t.replace(new RegExp(`\\s*#\\[\\[${esc}\\]\\]`, "gi"), "").replace(new RegExp(`\\s*#${esc}(?![\\w/-])`, "gi"), "");
     }
     const present = lowerTags(t);
     const add = (newTags || []).filter((x) => x && !present.includes(x.toLowerCase())).map(tagToken);
@@ -827,37 +835,42 @@ MAINTENANCE
       if (ev.type === "message_start" && ev.message) { usage = ev.message.usage || usage; model = ev.message.model || model; }
       else if (ev.type === "content_block_start" && ev.content_block) {
         const b = ev.content_block;
-        blocks.set(ev.index, b.type === "tool_use" ? { type: "tool_use", id: b.id, name: b.name, json: "" } : { type: b.type, text: b.text || "" });
+        blocks.set(ev.index, b.type === "tool_use" ? { type: "tool_use", id: b.id, name: b.name, json: "" } : b.type === "text" ? { type: "text", text: b.text || "" } : Object.assign({}, b));
       } else if (ev.type === "content_block_delta" && ev.delta && blocks.has(ev.index)) {
         const b = blocks.get(ev.index);
         if (ev.delta.type === "text_delta" && b.type === "text") { b.text += ev.delta.text || ""; if (onText && ev.delta.text) onText(ev.delta.text); }
         else if (ev.delta.type === "input_json_delta" && b.type === "tool_use") b.json += ev.delta.partial_json || "";
+        // thinking blocks must go back to the API exactly as they came (text and signature) when the model is asked again
+        else if (ev.delta.type === "thinking_delta" && b.type === "thinking") b.thinking = (b.thinking || "") + (ev.delta.thinking || "");
+        else if (ev.delta.type === "signature_delta" && b.type === "thinking") b.signature = ev.delta.signature;
       } else if (ev.type === "message_delta") {
         if (ev.usage) usage = Object.assign({}, usage, ev.usage);
         if (ev.delta && ev.delta.stop_reason) stop_reason = ev.delta.stop_reason;
         if (ev.delta && ev.delta.stop_details) stop_details = ev.delta.stop_details;
       } else if (ev.type === "error") throw new Error("Claude API stream error: " + JSON.stringify(ev.error || ev));
     };
+    const eat = (chunk) => {
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+        let ev; try { ev = JSON.parse(data); } catch (e) { continue; }
+        handle(ev);
+      }
+    };
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
-      buf += dec.decode(value, { stream: true });
+      buf = (buf + dec.decode(value, { stream: true })).replace(/\r\n/g, "\n");
       let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
-        for (const line of chunk.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let ev; try { ev = JSON.parse(data); } catch (e) { continue; }
-          handle(ev);
-        }
-      }
+      while ((i = buf.indexOf("\n\n")) >= 0) { const chunk = buf.slice(0, i); buf = buf.slice(i + 2); eat(chunk); }
     }
+    eat(buf + dec.decode()); // a last event that was not followed by a blank line
     const content = [];
     for (const b of blocks.values()) {
       if (b.type === "tool_use") { let input = {}; try { input = JSON.parse(b.json || "{}"); } catch (e) { input = { raw: b.json }; } content.push({ type: "tool_use", id: b.id, name: b.name, input }); }
-      else content.push({ type: "text", text: b.text || "" });
+      else if (b.type === "text") { if (b.text) content.push({ type: "text", text: b.text }); } // the API rejects an empty text block when the turn is sent back
+      else content.push(b);
     }
     return { content, usage, stop_reason, stop_details, model };
   }
@@ -982,6 +995,7 @@ MAINTENANCE
       if (decide) data = await res.json();
       else if (res.body && typeof res.body.getReader === "function") data = await readStream(res, onText);
       else { data = await res.json(); if (onText) for (const b of data.content || []) if (b.type === "text" && b.text) onText(b.text); } // a plain JSON reply (tests)
+      if (!decide && data.stop_reason === "max_tokens") throw new Error("Claude's answer was cut off at the output limit (too many cards for one run); nothing was changed");
       if (data.stop_reason === "refusal") throw new Error("Claude declined the request" + (data.stop_details?.explanation ? ": " + data.stop_details.explanation : ""));
       return data;
     };
@@ -1051,7 +1065,7 @@ MAINTENANCE
       // an existing card keeps the tag the user (or an earlier version) gave it
       if (raw.uid && byUid.has(raw.uid) && hasTag(byUid.get(raw.uid).text, ankifyTag)) text = ensureAnkifyTag(text, ankifyTag);
       const back = (raw.back || []).map((b) => normaliseCloze(String(b)).trim()).filter(Boolean);
-      if (!norm(text)) return;
+      if (!norm(text) && !(raw.uid && frozen.has(raw.uid))) return; // a frozen note's text is ignored anyway
       if (raw.uid && byUid.has(raw.uid) && frozen.has(raw.uid)) {
         // frozen: the text is never touched, but the note may be filed under another heading
         if (seen.has(raw.uid)) return;
@@ -1063,7 +1077,9 @@ MAINTENANCE
       if (raw.uid && byUid.has(raw.uid) && !seen.has(raw.uid)) {
         seen.add(raw.uid);
         const cur = byUid.get(raw.uid);
-        if (norm(cur.text) !== norm(text) || backTexts(cur).join("\n") !== back.map(norm).join("\n")) ops.updates.push({ uid: raw.uid, text, back, group });
+        // compared without the ankify tag: "#[[ankify]]" or a tag at the front is the user's, not a change to write back
+        const textChanged = norm(stripTag(cur.text, ankifyTag)) !== norm(stripTag(text, ankifyTag));
+        if (textChanged || backTexts(cur).join("\n") !== back.map(norm).filter(Boolean).join("\n")) ops.updates.push({ uid: raw.uid, text, back, group, textChanged });
         const targetUid = group ? group.uid : null; // null uid = new heading -> always a move
         if ((cur.groupUid || null) !== targetUid || (group && !group.uid)) ops.moves.push({ uid: raw.uid, group });
       } else if (!raw.uid || !byUid.has(raw.uid)) {
@@ -1078,6 +1094,7 @@ MAINTENANCE
       const g = { uid, title, parent, notes: [], groups: [] };
       for (const n of raw.notes || []) handleNote(n, g);
       if (depth < 1) for (const sub of raw.groups || []) { const s = handleGroup(sub, g, depth + 1); if (s) g.groups.push(s); }
+      else { const flat = (subs) => { for (const sub of subs || []) { for (const n of sub.notes || []) handleNote(n, g); flat(sub.groups); } }; flat(raw.groups); } // deeper than two levels: the notes are kept, filed here
       return g;
     };
     for (const raw of result.notes || []) handleNote(raw, null);
@@ -1105,7 +1122,9 @@ MAINTENANCE
     }
     let stale = false;
     try {
-      stale = state.contentHash !== contentHash(await adapter.getSiblingTrees(homeUid));
+      const trees = await adapter.getSiblingTrees(homeUid);
+      // hashes stored before nested card sections were left out covered the whole tree: still current
+      stale = state.contentHash !== contentHash(withoutHomes(trees)) && state.contentHash !== contentHash(trees);
       // parentHash is absent in state written before the parent block was sent: those blocks are not stale for that reason
       if (!stale && state.parentHash != null) stale = state.parentHash !== hash(await parentTextOf(adapter, homeUid));
     } catch (e) {}
@@ -1139,7 +1158,7 @@ MAINTENANCE
       const state = parseState(stateBlock && stateBlock.text);
       const { vanished } = reconcile(state, notes);
       try { await recordExamples(adapter, home, notes, state, vanished, cfg.ankifyTag); } catch (e) { console.error("[auto-anki] examples", e); }
-      const contentTrees = await adapter.getSiblingTrees(homeUid);
+      const contentTrees = withoutHomes(await adapter.getSiblingTrees(homeUid));
       const parentText = await parentTextOf(adapter, homeUid);
       if (!outline(contentTrees).trim() && !parentText) throw new Error("no content blocks next to the home block");
       const hl = homeTagsLower();
@@ -1209,8 +1228,16 @@ MAINTENANCE
         if (streamError) throw streamError;
       } catch (e) { await queue; await rollback(); throw e; }
       const { result, usage, contact: rec } = call;
-      await showNotes(adapter, call.notes);
+      await showNotes(adapter, call.notes || []);
       if (rec) { await rollback(); await recordContact(adapter, rec); return { created: 0, updated: 0, deleted: 0, tags: [], usage, contact: rec }; }
+      // From here on the cards that streamed in stay. If applying the rest fails part-way, they (and whatever
+      // else was written) are still recorded in the state block: a card with no record would be taken for one
+      // the user wrote, frozen for good and filed on the examples page as theirs.
+      const recordLive = () => {
+        for (const ln of live.notes.values()) state.notes[ln.uid] = { hash: fingerprint(ln), text: stripTag(ln.text, cfg.ankifyTag), back: ln.children.map((c) => c.text), at: Date.now() };
+        for (const [uid, title] of live.made) state.groups[uid] = { text: title };
+      };
+      try {
       // what streamed in exists now: give the planner those uids so it leaves the blocks alone
       for (const [uid, title] of live.made) groupIndex.set(uid, { uid, text: title, notes: [], groups: [] });
       const adopt = (obj, path) => {
@@ -1236,7 +1263,7 @@ MAINTENANCE
       const targetOf = (group) => (group ? group.uid : homeUid);
       for (const u of ops.updates) {
         const cur = byUid.get(u.uid);
-        if (norm(cur.text) !== norm(u.text)) await adapter.updateBlock(u.uid, u.text);
+        if (u.textChanged) await adapter.updateBlock(u.uid, u.text);
         await syncBack(adapter, cur, u.back);
         state.notes[u.uid] = { hash: fingerprint({ text: u.text, children: u.back.map((t) => ({ text: t })) }), text: stripTag(u.text, cfg.ankifyTag), back: u.back, at: Date.now() };
       }
@@ -1252,19 +1279,27 @@ MAINTENANCE
         state.notes[uid] = { hash: fingerprint({ text: c.text, children: c.back.map((t) => ({ text: t })) }), text: stripTag(c.text, cfg.ankifyTag), back: c.back, at: Date.now() };
       }
       for (const uid of ops.deletes) { await adapter.deleteBlock(uid); delete state.notes[uid]; }
-      for (const ln of live.notes.values()) state.notes[ln.uid] = { hash: fingerprint(ln), text: stripTag(ln.text, cfg.ankifyTag), back: ln.children.map((c) => c.text), at: Date.now() };
-      for (const [uid, title] of live.made) state.groups[uid] = { text: title };
+      recordLive();
       await pruneGroups(adapter, homeUid, state, cfg.ankifyTag);
       if (ops.tags.length || (state.llmTags || []).length) {
-        const newText = homeTextWithTags(home.text, state.llmTags, ops.tags);
+        // Tags already on the block without the model's doing are the user's: recording them as the model's
+        // let a later run strip them. A home, off or ankify tag from the model would change what the block is.
+        const own = lowerTags(homeTextWithTags(home.text, state.llmTags, []));
+        const reserved = [...homeTagsLower(), ...(settings.offTags || []).map((t) => String(t).trim().toLowerCase()), String(cfg.ankifyTag || DEFAULT_ANKIFY_TAG).toLowerCase(), STATE_TAG];
+        const tags = ops.tags.filter((t) => !own.includes(t) && !reserved.includes(t));
+        const newText = homeTextWithTags(home.text, state.llmTags, tags);
         if (newText !== home.text) await adapter.updateBlock(homeUid, newText);
-        state.llmTags = ops.tags;
+        state.llmTags = tags;
       }
       state.contentHash = contentHash(contentTrees);
       state.parentHash = hash(parentText);
       state.updatedAt = Date.now();
       await writeState(adapter, homeUid, stateBlock, state);
-      return { created: ops.creates.length + live.notes.size, updated: ops.updates.length, deleted: ops.deletes.length, tags: ops.tags, usage };
+      return { created: ops.creates.length + live.notes.size, updated: ops.updates.length, deleted: ops.deletes.length, tags: state.llmTags, usage };
+      } catch (e) {
+        try { recordLive(); await writeState(adapter, homeUid, stateBlock, state); } catch (e2) { console.error("[auto-anki] could not record the cards written before the failure", e2); }
+        throw e;
+      }
     } finally {
       busy.delete(homeUid);
     }
@@ -1306,7 +1341,7 @@ MAINTENANCE
     settings, DEFAULT_HOME_TAGS, DEFAULT_OFF_TAGS, isOff, isActive, STATE_TAG, DEFAULT_ANKIFY_TAG, SYSTEM, SCHEMA,
     norm, hash, lowerTags, isHome, isStateBlock, emptyState, parseState, serializeState,
     splitChildren, reconcile, fingerprint, backTexts, outline, contentHash,
-    ensureAnkifyTag, cardText, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, showNotes, plan, pruneGroups,
+    withoutHomes, ensureAnkifyTag, cardText, normaliseCloze, homeTextWithTags, slashTriggerAt, tagAsHome, buildUserMessage, groupingRules, DEFAULT_GROUPING, callClaude, readStream, jsonNoteScanner, recordContact, showNotes, plan, pruneGroups,
     defaultPromptTrees, promptFromTrees, recordExamples, examplesText,
   };
 })(typeof window !== "undefined" ? window : globalThis);
@@ -1518,7 +1553,7 @@ MAINTENANCE
   }
 
   // ---------- live watching ----------
-  const watched = new Map(); // parentUid -> callback
+  const watched = new Map(); // parentUid -> Set of home uids under it (one pull watch per parent; two card sections can share a parent)
   const timers = new Map();
   function watchParents() {
     for (const c of homeContainers()) {
@@ -1526,24 +1561,33 @@ MAINTENANCE
       if (!uid) continue;
       const b = api.pull("[{:block/_children [:block/uid]}]", [":block/uid", uid]);
       const parentUid = b && b[":block/_children"] && b[":block/_children"][0] && b[":block/_children"][0][":block/uid"];
-      if (!parentUid || watched.has(parentUid)) continue;
+      if (!parentUid) continue;
+      if (watched.has(parentUid)) { watched.get(parentUid).add(uid); continue; }
+      const homes = new Set([uid]);
       const cb = () => {
-        clearTimeout(timers.get(uid));
-        timers.set(uid, setTimeout(() => { statusCache.delete(uid); refreshStatus(uid); }, 1500));
+        for (const h of homes) {
+          clearTimeout(timers.get(h));
+          timers.set(h, setTimeout(() => { statusCache.delete(h); refreshStatus(h); }, 1500));
+        }
       };
       try {
         api.data.addPullWatch(`[:block/string {:block/children ...}]`, `[:block/uid "${parentUid}"]`, cb);
-        watched.set(parentUid, cb);
+        watched.set(parentUid, homes);
       } catch (e) { console.warn("[auto-anki] pull watch failed", e); }
     }
   }
 
   const autoTimers = new Map();
+  // Blocks whose last run failed or ended with Claude asking for Eli: no automatic run until the user starts
+  // one by hand. Without this a stale block was retried every quietMinutes for ever, and a retry after
+  // contact_eli pushes past a message the task is meant to stop on.
+  const autoHold = new Set();
   function scheduleAuto(uid) {
     clearTimeout(autoTimers.get(uid));
+    if (autoHold.has(uid)) return;
     autoTimers.set(uid, setTimeout(() => {
       const st = statusCache.get(uid);
-      if (st && st.stale && !core.isBusy(uid)) update(uid, true);
+      if (st && st.stale && !core.isBusy(uid) && !autoHold.has(uid)) update(uid, true);
     }, Math.max(0.5, CONFIG.quietMinutes) * 60000));
   }
 
@@ -1556,16 +1600,18 @@ MAINTENANCE
   async function update(uid, quiet) {
     if (!apiKey()) { toast("Auto-anki: set the API key first (command palette → Auto-anki: set API key)", "warning"); return; }
     if (core.isBusy(uid)) return;
+    if (!quiet) autoHold.delete(uid);
     decorate();
     try {
       const run = core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, tagCards: CONFIG.tagNewCards, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
       decorate(); // the core marked the block busy: show the pulsing dot while Claude works
       const r = await run;
       statusCache.delete(uid);
-      if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
+      if (r.contact) { autoHold.add(uid); return; } // Claude asked for Eli: the core recorded it and said so; nothing was written
       if (!quiet) toast(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
     } catch (e) {
       console.error("[auto-anki]", e);
+      autoHold.add(uid);
       toast("Auto-anki failed: " + e.message, "error");
     } finally {
       refreshStatus(uid);

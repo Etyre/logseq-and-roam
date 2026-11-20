@@ -205,7 +205,7 @@
   }
 
   // ---------- live watching ----------
-  const watched = new Map(); // parentUid -> callback
+  const watched = new Map(); // parentUid -> Set of home uids under it (one pull watch per parent; two card sections can share a parent)
   const timers = new Map();
   function watchParents() {
     for (const c of homeContainers()) {
@@ -213,24 +213,33 @@
       if (!uid) continue;
       const b = api.pull("[{:block/_children [:block/uid]}]", [":block/uid", uid]);
       const parentUid = b && b[":block/_children"] && b[":block/_children"][0] && b[":block/_children"][0][":block/uid"];
-      if (!parentUid || watched.has(parentUid)) continue;
+      if (!parentUid) continue;
+      if (watched.has(parentUid)) { watched.get(parentUid).add(uid); continue; }
+      const homes = new Set([uid]);
       const cb = () => {
-        clearTimeout(timers.get(uid));
-        timers.set(uid, setTimeout(() => { statusCache.delete(uid); refreshStatus(uid); }, 1500));
+        for (const h of homes) {
+          clearTimeout(timers.get(h));
+          timers.set(h, setTimeout(() => { statusCache.delete(h); refreshStatus(h); }, 1500));
+        }
       };
       try {
         api.data.addPullWatch(`[:block/string {:block/children ...}]`, `[:block/uid "${parentUid}"]`, cb);
-        watched.set(parentUid, cb);
+        watched.set(parentUid, homes);
       } catch (e) { console.warn("[auto-anki] pull watch failed", e); }
     }
   }
 
   const autoTimers = new Map();
+  // Blocks whose last run failed or ended with Claude asking for Eli: no automatic run until the user starts
+  // one by hand. Without this a stale block was retried every quietMinutes for ever, and a retry after
+  // contact_eli pushes past a message the task is meant to stop on.
+  const autoHold = new Set();
   function scheduleAuto(uid) {
     clearTimeout(autoTimers.get(uid));
+    if (autoHold.has(uid)) return;
     autoTimers.set(uid, setTimeout(() => {
       const st = statusCache.get(uid);
-      if (st && st.stale && !core.isBusy(uid)) update(uid, true);
+      if (st && st.stale && !core.isBusy(uid) && !autoHold.has(uid)) update(uid, true);
     }, Math.max(0.5, CONFIG.quietMinutes) * 60000));
   }
 
@@ -243,16 +252,18 @@
   async function update(uid, quiet) {
     if (!apiKey()) { toast("Auto-anki: set the API key first (command palette → Auto-anki: set API key)", "warning"); return; }
     if (core.isBusy(uid)) return;
+    if (!quiet) autoHold.delete(uid);
     decorate();
     try {
       const run = core.runUpdate(adapter, uid, { apiKey: apiKey(), model: CONFIG.model, effort: CONFIG.effort, ankifyTag: CONFIG.ankifyTag, tagCards: CONFIG.tagNewCards, extraInstructions: CONFIG.extraInstructions, promptPage: CONFIG.promptPage, grouping: CONFIG.grouping });
       decorate(); // the core marked the block busy: show the pulsing dot while Claude works
       const r = await run;
       statusCache.delete(uid);
-      if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
+      if (r.contact) { autoHold.add(uid); return; } // Claude asked for Eli: the core recorded it and said so; nothing was written
       if (!quiet) toast(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
     } catch (e) {
       console.error("[auto-anki]", e);
+      autoHold.add(uid);
       toast("Auto-anki failed: " + e.message, "error");
     } finally {
       refreshStatus(uid);

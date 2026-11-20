@@ -665,3 +665,91 @@ function sseResponse({ content, stop_reason = "end_turn" }, onChunk) {
   }
   console.log("streaming tests OK");
 })().catch((e) => { console.error(e); process.exit(1); });
+
+// ----- regressions from the 2026-11-20 bug hunt -----
+(async () => {
+  const jsonReply = (a, stop_reason = "end_turn") => ({ ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: JSON.stringify(a) }], usage: {}, stop_reason }), text: async () => "" });
+  // a Roam attribute is content; a Logseq property line after the first line is not
+  assert.strictEqual(core.norm("Author:: Kissinger"), "Author:: Kissinger");
+  assert.strictEqual(core.norm("Body\nid:: 123"), "Body");
+  assert.ok(/Author:: Kissinger/.test(core.outline([{ uid: "x", text: "Author:: Kissinger", children: [] }])));
+  // a card section deeper in the content is not source material
+  const nested = [{ uid: "s", text: "Sub-section", children: [
+    { uid: "f", text: "a fact", children: [] },
+    { uid: "h2", text: "#[[auto-generate cards]]", children: [{ uid: "k", text: "a card {c1:x}", children: [] }, { uid: "st", text: '#auto-anki-state {"notes":{}}', children: [] }] },
+  ] }];
+  assert.strictEqual(core.outline(core.withoutHomes(nested)), "- Sub-section\n  - a fact\n");
+  assert.strictEqual(nested[0].children.length, 2, "the input trees are not modified");
+  // "#tag/sub" is a different tag
+  assert.strictEqual(core.homeTextWithTags("x #history/us #history", ["history"], []), "x #history/us");
+  assert.strictEqual(core.cardText("y #ankify/deck", "ankify", false), "y #ankify/deck");
+  // the user's own way of writing the ankify tag is not a change to write back
+  {
+    const cur = { uid: "a", text: "#[[ankify]] Foo {c1:bar}", children: [] };
+    const state = core.emptyState(); state.notes.a = { hash: core.fingerprint(cur) };
+    const ops = core.plan({ tags: [], notes: [{ uid: "a", text: "Foo {c1:bar}", back: [] }], groups: [], delete: [] }, [cur], state, "ankify");
+    assert.deepStrictEqual(ops.updates, [], "no rewrite when only the tag's form or place differs");
+    const ops2 = core.plan({ tags: [], notes: [{ uid: "a", text: "Foo {c1:baz}", back: [] }], groups: [], delete: [] }, [cur], state, "ankify");
+    assert.strictEqual(ops2.updates[0].text, "Foo {c1:baz} #ankify", "a real change keeps the card tagged");
+  }
+  // a frozen note is filed under a heading even when the model sends no text for it
+  {
+    const cur = { uid: "f", text: "mine", children: [], groupUid: null };
+    const state = core.emptyState(); state.frozen = ["f"];
+    const ops = core.plan({ tags: [], notes: [], groups: [{ uid: null, title: "T", notes: [{ uid: "f", text: "", back: [] }], groups: [] }], delete: [] }, [cur], state, "ankify");
+    assert.strictEqual(ops.moves.length, 1);
+  }
+  // notes in a group nested deeper than two levels are kept
+  {
+    const ops = core.plan({ tags: [], notes: [], groups: [{ uid: null, title: "A", notes: [], groups: [{ uid: null, title: "B", notes: [], groups: [{ uid: null, title: "C", notes: [{ uid: null, text: "deep {c1:x}", back: [] }] }] }] }], delete: [] }, [], core.emptyState(), "ankify");
+    assert.strictEqual(ops.creates.length, 1);
+    assert.strictEqual(ops.creates[0].group.title, "B");
+  }
+  // readStream: thinking blocks come back whole, an empty text block is dropped, the last event needs no blank line, CRLF framing works
+  {
+    const evs = [
+      { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hm" } },
+      { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SIG" } },
+      { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+      { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "{}" } },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+    ];
+    const wire = evs.map((ev) => `data: ${JSON.stringify(ev)}`).join("\r\n\r\n"); // no trailing blank line
+    const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(wire)); c.close(); } });
+    const d = await core.readStream({ body });
+    assert.deepStrictEqual(d.content, [{ type: "thinking", thinking: "hm", signature: "SIG" }, { type: "text", text: "{}" }]);
+    assert.strictEqual(d.stop_reason, "end_turn");
+  }
+  // a cut-off answer is reported as such
+  {
+    const { adapter } = fakeGraph("HM");
+    await assert.rejects(core.runUpdate(adapter, "HM", { apiKey: "k", ankifyTag: "ankify", fetchImpl: async () => jsonReply({}, "max_tokens") }), /cut off/);
+  }
+  // topic tags: the user's own tag survives a run that no longer returns it; reserved tags are never added
+  {
+    const { g, adapter } = fakeGraph("HT");
+    g.HT.text = "#[[auto-generate cards]] #mine";
+    const answers = [{ tags: ["mine", "rivers", "ankify", "auto-anki off"], notes: [], groups: [], delete: [] }, { tags: [], notes: [], groups: [], delete: [] }];
+    const cfg = { apiKey: "k", ankifyTag: "ankify", fetchImpl: async () => jsonReply(answers.shift()) };
+    await core.runUpdate(adapter, "HT", cfg);
+    assert.strictEqual(g.HT.text, "#[[auto-generate cards]] #mine #rivers");
+    await core.runUpdate(adapter, "HT", cfg);
+    assert.strictEqual(g.HT.text, "#[[auto-generate cards]] #mine", "only the model's own tag is removed");
+  }
+  // a failure while applying the answer still records the cards that streamed in, so they are not taken for the user's
+  {
+    const { g, adapter } = fakeGraph("HF");
+    g.old = { uid: "old", text: "old {c1:card}", children: [] }; g.HF.children.push("old");
+    const st0 = core.emptyState(); st0.notes.old = { hash: core.fingerprint(g.old) };
+    g.sb = { uid: "sb", text: core.serializeState(st0), children: [] }; g.HF.children.push("sb");
+    adapter.updateBlock = async (uid, text) => { if (uid === "old") throw new Error("write refused"); g[uid].text = text; };
+    const answer = { tags: [], notes: [{ uid: null, text: "new {c1:card}", back: [] }, { uid: "old", text: "old {c1:changed}", back: [] }], groups: [], delete: [] };
+    await assert.rejects(core.runUpdate(adapter, "HF", { apiKey: "k", ankifyTag: "ankify", fetchImpl: async () => sseResponse({ content: [{ type: "text", text: JSON.stringify(answer) }] }) }), /write refused/);
+    const r = await core.refresh(adapter, "HF", { persist: false });
+    assert.strictEqual(r.notes.length, 2);
+    assert.strictEqual(r.frozen.size, 0, "the streamed card is on record as the model's");
+  }
+  console.log("bug-hunt regression tests OK");
+})().catch((e) => { console.error(e); process.exit(1); });

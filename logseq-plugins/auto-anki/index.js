@@ -62,7 +62,8 @@ const adapter = {
     let kids;
     if (home.parentIsPage) kids = await logseq.Editor.getPageBlocksTree(home.pageTitle || home.pageId);
     else { const p = await logseq.Editor.getBlock(home.parentUid, { includeChildren: true }); kids = (p && p.children) || []; }
-    return (kids || []).filter((b) => b && b.uuid).map(toTree).filter((t) => t.uid !== uid && !t["preBlock?"] && !core.isHome(t.text));
+    // the page-properties block is dropped before toTree, which does not carry "preBlock?" over
+    return (kids || []).filter((b) => b && b.uuid && !b["preBlock?"]).map(toTree).filter((t) => t.uid !== uid && !core.isHome(t.text));
   },
   async getParentText(uid) {
     // a top-level block's parent is the page: the page title is sent separately
@@ -147,7 +148,8 @@ const adapter = {
 // ---------- DOM decoration ----------
 const statusCache = new Map();
 const doc = () => top.document;
-const tagSelector = () => homeTagList().map((t) => `a.tag[data-ref="${t.toLowerCase().replace(/"/g, '\\"')}"]`).join(", ");
+// a home tag counts as "#tag" and as a plain "[[page link]]" (core.isHome accepts both), so match both renderings
+const tagSelector = () => homeTagList().map((t) => t.toLowerCase().replace(/"/g, '\\"')).map((t) => `a.tag[data-ref="${t}"], a.page-ref[data-ref="${t}"]`).join(", ");
 
 function homeElements() {
   const sel = tagSelector();
@@ -206,9 +208,13 @@ async function refreshStatus(uid) {
 }
 
 const autoTimers = new Map();
+// Blocks whose last run failed or ended with Claude asking for Eli: no automatic run until the user starts one
+// by hand (otherwise a stale block is retried every few minutes for ever, also past a contact_eli message).
+const autoHold = new Set();
 function scheduleAuto(uid) {
   clearTimeout(autoTimers.get(uid));
-  autoTimers.set(uid, setTimeout(() => { const st = statusCache.get(uid); if (st && st.stale && !core.isBusy(uid)) update(uid, true); }, Math.max(0.5, Number(S().quietMinutes) || 3) * 60000));
+  if (autoHold.has(uid)) return;
+  autoTimers.set(uid, setTimeout(() => { const st = statusCache.get(uid); if (st && st.stale && !core.isBusy(uid) && !autoHold.has(uid)) update(uid, true); }, Math.max(0.5, Number(S().quietMinutes) || 3) * 60000));
 }
 
 // ---------- update ----------
@@ -216,16 +222,18 @@ async function update(uid, quiet) {
   const cfg = S();
   if (!cfg.apiKey) { logseq.UI.showMsg("Auto-anki: set the API key in the plugin settings first", "warning"); return; }
   if (core.isBusy(uid)) return;
+  if (!quiet) autoHold.delete(uid);
   decorate();
   try {
     const run = core.runUpdate(adapter, uid, { apiKey: cfg.apiKey, model: cfg.model, effort: cfg.effort, ankifyTag: cfg.ankifyTag, tagCards: cfg.tagNewCards, extraInstructions: cfg.extraInstructions, promptPage: cfg.promptPage, grouping: { threshold: cfg.groupThreshold, min: cfg.groupMin, max: cfg.groupMax } });
     decorate(); // the core marked the block busy: show the pulsing dot while Claude works
     const r = await run;
     statusCache.delete(uid);
-    if (r.contact) return; // Claude asked for Eli: the core recorded it and said so; nothing was written
+    if (r.contact) { autoHold.add(uid); return; } // Claude asked for Eli: the core recorded it and said so; nothing was written
     if (!quiet) logseq.UI.showMsg(`Auto-anki: ${r.created} new, ${r.updated} updated, ${r.deleted} removed`, "success");
   } catch (e) {
     console.error("[auto-anki]", e);
+    autoHold.add(uid);
     logseq.UI.showMsg("Auto-anki failed: " + e.message, "error", { timeout: 8000 });
   } finally { refreshStatus(uid); }
 }
