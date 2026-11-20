@@ -10,3 +10,5 @@ writes the same property for the imported graph; `config.edn` hides it
 Command "Page tags: sync the hidden page-tags property on this page" forces an update.
 
 Install: Settings, Advanced, Developer mode; Plugins, "Load unpacked plugin", this folder.
+
+**Gotcha (2026-11-20):** the "already in sync" test compares tag names as a set. It used to compare the raw `tags::` line with the property Logseq hands back, which never matched for `tags:: #a`, `[[a]],[[b]]` or a different order, so every top-level block was rewritten every 1.5 s for as long as the page was loaded. The sync also waits while the page-properties block is being edited.

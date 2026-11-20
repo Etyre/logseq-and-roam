@@ -59,8 +59,11 @@ function main() {
   );
   // journals view, page view, any navigation
   logseq.App.onRouteChanged(() => schedule(300));
-  // the tag was just typed (or the graph just finished loading)
-  logseq.DB.onChanged(() => schedule(1500));
+  // The tag was just typed. Only then: a run after every change anywhere folded a tagged block
+  // again 1.5 s after each keystroke while you were working inside it.
+  logseq.DB.onChanged(({ blocks }) => {
+    if ((blocks || []).some((b) => b && /(#|\[\[)auto-collapse/i.test(b.content || ""))) schedule(1500);
+  });
   logseq.App.onCurrentGraphChanged(() => schedule(3000));
   schedule(3000);
   setTimeout(() => schedule(0), 30000);

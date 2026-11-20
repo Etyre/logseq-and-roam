@@ -47,3 +47,11 @@ appear after a plugin reload or a Logseq restart.
 
 **Dropdown**: every command is also a slash command prefixed `SB`, so typing `/sb da`
 filters to the DATE entries and inserts the token at the cursor, like `<%` did in Roam.
+
+**Gotchas learned** (2026-11-20 review; fixed in code, not yet seen running in Logseq):
+
+- Text in `{% %}` or `<% %>` that is not one of this plugin's commands or a date (Liquid, ERB, a typo, a `{%` that is never closed) is left exactly as typed, and the tokens after it still expand. Before, `<%= x %>` became today's journal link and one unknown token stopped every later one.
+- A block is read again just before it is expanded, and only one expansion pass runs at a time: the change event's snapshot can be older than what you typed since, and the plugin's own `id::` write queues the block a second time (which used to ask `INPUT` twice).
+- Edit mode is left only when the plugin has something to write.
+- A block that has children is never removed (an empty block replaced by a template, a `NOBLOCKOUTPUT` block): Logseq's `removeBlock` takes the children with it.
+- `{%PARENT...%}` treats a block as part of the inserted template only if it changed within 1.5 s of the token block; a parent you typed earlier counts as the real parent.

@@ -32,10 +32,16 @@
 
 const ATTR_LINE = /^([A-Za-z][\w.\-]*)::[ \t]?(.*)$/;
 const vars = {};
-const recent = new Set();     // uuids seen in recent onChanged batches (an insertion)
+const recent = new Map();     // uuid -> time it last appeared in an onChanged batch
+// Blocks that changed in the same moment as the token block were inserted with it (a template);
+// one edited longer ago is a real parent. (This used to be every block changed since the last
+// expansion, so {%PARENTTEXT%} skipped a parent the user had just typed.)
+const INSERTED_WITHIN_MS = 1500;
+const CURSOR_MARK = "\uE000CURSOR\uE000"; // private-use characters: cannot collide with typed text
 let cursorTarget = null;
-let queue = [];
+let queue = new Map();        // uuid -> true: blocks to look at, re-read when their turn comes
 let timer = null;
+let running = false;
 
 // ---------------------------------------------------------------- helpers
 
@@ -71,12 +77,14 @@ function esc(s) {
 
 async function parentOfInsertion(block) {
   let b = block;
+  const at = recent.get(block.uuid) || Date.now();
+  const insertedWith = (uuid) => recent.has(uuid) && Math.abs(recent.get(uuid) - at) <= INSERTED_WITHIN_MS;
   for (let i = 0; i < 40 && b; i++) {
     const pid = b.parent && b.parent.id;
     if (!pid || (b.page && pid === b.page.id)) return null;
     const parent = await logseq.Editor.getBlock(pid);
     if (!parent) return null;
-    if (!recent.has(parent.uuid)) return parent;
+    if (!insertedWith(parent.uuid)) return parent;
     b = parent;
   }
   return null;
@@ -95,7 +103,8 @@ function formatDate(d, fmt) {
     d: String(d.getDate()), EEEE: DAYS[d.getDay()], EEE: DAYS[d.getDay()].slice(0, 3), E: DAYS[d.getDay()].slice(0, 3),
   })[t]);
 }
-function parseNaturalDate(text) {
+/** strict: null for text that is not a date (the default falls back to today, as {%DATE:...%} always has). */
+function parseNaturalDate(text, strict = false) {
   const s = (text || "").trim().toLowerCase();
   const d = new Date(); d.setHours(0, 0, 0, 0);
   if (!s || s === "today" || s === "now") return d;
@@ -121,7 +130,7 @@ function parseNaturalDate(text) {
   m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
   const p = new Date(text);
-  return isNaN(p) ? d : p;
+  return isNaN(p) ? (strict ? null : d) : p;
 }
 async function journalTitle(d) {
   const cfg = await logseq.App.getUserConfigs();
@@ -138,7 +147,7 @@ function findToken(s, from = 0) {
     else if (s.startsWith("%}", j)) { depth--; j += 2; if (depth === 0) return { start: i, end: j, inner: s.slice(i + 2, j - 2) }; }
     else j++;
   }
-  return null;
+  return findToken(s, i + 2); // this "{%" is never closed: it is plain text, look further on
 }
 function splitArgs(s) {
   // top-level commas only (not inside nested tokens, brackets or parens)
@@ -148,7 +157,7 @@ function splitArgs(s) {
     if (s.startsWith("{%", i)) { depth++; cur += "{%"; i++; continue; }
     if (s.startsWith("%}", i)) { depth--; cur += "%}"; i++; continue; }
     if (c === "[" || c === "(" || c === "{") depth++;
-    if (c === "]" || c === ")" || c === "}") depth--;
+    if (c === "]" || c === ")" || c === "}") depth = Math.max(0, depth - 1); // a stray ")" in prose must not switch off every later comma
     if (c === "," && depth === 0) { out.push(cur); cur = ""; continue; }
     cur += c;
   }
@@ -156,6 +165,9 @@ function splitArgs(s) {
   return out;
 }
 const LAZY = new Set(["REPEAT", "IF", "IFDAYOFWEEK", "JAVASCRIPT", "J"]);
+const KNOWN = new Set(["CURSOR", "NOBLOCKOUTPUT", "CURRENTPAGENAME", "CURRENTPAGE", "PAGELINK", "BLOCKLINK", "BLOCKREF", "PARENTTEXT", "PARENTLINK", "PARENTREF",
+  "PARENTPAGE", "DATE", "DATEPLAIN", "TIME", "TIMEAMPM", "RANDOMNUMBER", "RANDOMBLOCK", "RANDOMBLOCKFROM", "RANDOMBLOCKMENTION", "RANDOMCHILDOF", "RANDOMPAGE",
+  "INPUT", "SET", "GET", "HAS", "IF", "IFDAYOFWEEK", "REPEAT", "CONCAT", "UPPER", "LOWER", "TRIM", "CHILDREN", "SMARTBLOCK", "JAVASCRIPT", "J"]);
 
 async function expandLogseqVars(text, ctx) {
   // Logseq's own template variables, for templates the plugin inserted itself
@@ -166,7 +178,11 @@ async function expandLogseqVars(text, ctx) {
     let rep;
     if (v === "current page") rep = ctx.page ? `[[${ctx.page.originalName || ctx.page.name}]]` : "";
     else if (v === "time") rep = await runCommand("TIME", "", ctx);
-    else rep = `[[${await journalTitle(parseNaturalDate(v))}]]`;
+    else {
+      // anything that is not a date (ERB/EJS snippets, typos) is left exactly as typed
+      const d = parseNaturalDate(v, true);
+      rep = d ? `[[${await journalTitle(d)}]]` : m[0];
+    }
     out += text.slice(last, m.index) + rep; last = m.index + m[0].length;
   }
   return out + text.slice(last);
@@ -176,12 +192,14 @@ async function expandText(text, ctx) {
   if (text.includes("<%")) text = await expandLogseqVars(text, ctx);
   // repeatedly expand the first token; nested args are expanded before the command
   // unless the command is lazy (it decides what to evaluate)
-  let guard = 0;
+  let guard = 0, from = 0;
   while (guard++ < 500) {
-    const t = findToken(text);
+    const t = findToken(text, from);
     if (!t) break;
     const colon = t.inner.indexOf(":");
     const name = (colon < 0 ? t.inner : t.inner.slice(0, colon)).trim().toUpperCase();
+    // unknown command (Liquid, a typo): left exactly as typed, and the tokens after it still expand
+    if (!KNOWN.has(name)) { from = t.end; continue; }
     let argText = colon < 0 ? "" : t.inner.slice(colon + 1);
     if (!LAZY.has(name) && argText.includes("{%")) argText = await expandText(argText, ctx);
     let out;
@@ -197,7 +215,7 @@ async function runCommand(name, argText, ctx) {
   const args = splitArgs(argText).map((a) => a.trim());
   const graph = ctx.graph;
   switch (name) {
-    case "CURSOR": ctx.cursor = true; return " CURSOR ";
+    case "CURSOR": ctx.cursor = true; return CURSOR_MARK;
     case "NOBLOCKOUTPUT": ctx.noOutput = true; return "";
     case "CURRENTPAGENAME": return ctx.page ? (ctx.page.originalName || ctx.page.name) : "";
     case "CURRENTPAGE": return ctx.page ? `[[${ctx.page.originalName || ctx.page.name}]]` : "";
@@ -212,7 +230,7 @@ async function runCommand(name, argText, ctx) {
     case "DATEPLAIN": return await journalTitle(parseNaturalDate(argText));
     case "TIME": { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
     case "TIMEAMPM": { const d = new Date(); const h = d.getHours() % 12 || 12; return `${h}:${pad(d.getMinutes())} ${d.getHours() < 12 ? "AM" : "PM"}`; }
-    case "RANDOMNUMBER": { const a = parseInt(args[0], 10) || 0, b = parseInt(args[1], 10) || 1; return String(Math.floor(Math.random() * (b - a + 1)) + a); }
+    case "RANDOMNUMBER": { const a = parseInt(args[0], 10) || 0, hi = parseInt(args[1], 10), b = Number.isNaN(hi) ? 1 : hi; return String(Math.floor(Math.random() * (b - a + 1)) + a); }
     case "RANDOMBLOCK": return refToRandom(await queryBlocks(`[:find (pull ?b [:block/uuid :block/content]) :where [?b :block/content ?c] [(not= ?c "")] [?b :block/page ?p]]`));
     case "RANDOMBLOCKFROM": return refToRandom(await queryBlocks(`[:find (pull ?b [:block/uuid :block/content]) :where [?b :block/page ?p] [?p :block/name "${lname(argText)}"] [?b :block/content ?c] [(not= ?c "")]]`));
     case "RANDOMBLOCKMENTION": return refToRandom(await queryBlocks(`[:find (pull ?b [:block/uuid :block/content]) :where [?b :block/refs ?r] [?r :block/name "${lname(argText)}"] [?b :block/content ?c] [(not= ?c "")]]`));
@@ -252,7 +270,7 @@ async function runCommand(name, argText, ctx) {
         texts.push(await expandText(body, ctx));
       }
       delete ctx.vars.ITERATION;
-      ctx.siblings.push(...texts);      // become sibling blocks after this one
+      ctx.siblings.push(...texts.map((t) => t.split(CURSOR_MARK).join("")));      // become sibling blocks after this one
       return "";
     }
     case "CONCAT": return args.join("");
@@ -296,7 +314,9 @@ async function templateBatch(name) {
   const full = await logseq.Editor.getBlock(root.uuid, { includeChildren: true });
   const strip = (content) => (content || "").split("\n").filter((l) => !/^(id|template|template-including-parent)::/.test(l.trim())).join("\n");
   const conv = (b) => ({ content: strip(b.content), children: (b.children || []).map((c) => conv(c)) });
-  const includeParent = !(full.properties && String(full.properties["template-including-parent"]) === "false");
+  // the plugin API hands property keys back camelCased
+  const fp = full.properties || {};
+  const includeParent = String(fp["template-including-parent"] !== undefined ? fp["template-including-parent"] : fp.templateIncludingParent) !== "false";
   return includeParent ? [conv(full)] : (full.children || []).map((c) => conv(c));
 }
 
@@ -307,7 +327,7 @@ async function insertTemplateAfter(uuid, name, replaceIfEmpty = false) {
   if (replaceIfEmpty) {
     // typed "/name" in an empty block: the template takes that block's place
     const cur = await logseq.Editor.getBlock(uuid);
-    if (cur && !(cur.content || "").trim() && !(cur.properties && Object.keys(cur.properties).length)) {
+    if (cur && !(cur.content || "").trim() && !(cur.properties && Object.keys(cur.properties).length) && !(await hasChildren(uuid))) {
       await logseq.Editor.removeBlock(uuid);
     }
   }
@@ -334,6 +354,12 @@ async function registerTemplateSlashCommands() {
 
 // ---------------------------------------------------------------- per-block expansion
 
+/** removeBlock takes the children with it: a block that has any is never removed. */
+async function hasChildren(uuid) {
+  const b = await logseq.Editor.getBlock(uuid, { includeChildren: true });
+  return !!(b && b.children && b.children.length);
+}
+
 async function expandBlock(block) {
   block = { ...block };
   const content = block.content || "";
@@ -344,13 +370,17 @@ async function expandBlock(block) {
   if (/\{%PARENT(TEXT|LINK|REF|PAGE)%\}/i.test(content)) ctx.parent = await parentOfInsertion(block);
   let out = await expandText(content, ctx);
   let cursorPos = -1;
-  // if this block is being edited, the editor's own text would overwrite our update
-  try {
-    const editing = await logseq.Editor.checkEditing();
-    if (editing && editing === block.uuid) await logseq.Editor.exitEditingMode(true);
-  } catch (e) { /* older API */ }
-  const ci = out.indexOf(" CURSOR ");
-  if (ci >= 0) { cursorPos = ci; out = out.replace(" CURSOR ", ""); }
+  const ci = out.indexOf(CURSOR_MARK);
+  if (ci >= 0) { cursorPos = ci; out = out.split(CURSOR_MARK).join(""); }
+  // If this block is being edited, the editor's own text would overwrite our update. Only when there is
+  // something to write: leaving edit mode for nothing threw the user out of a block at every pause while
+  // it held an unknown or half-typed token.
+  if (out !== content || ctx.siblings.length || ctx.templates.length) {
+    try {
+      const editing = await logseq.Editor.checkEditing();
+      if (editing && editing === block.uuid) await logseq.Editor.exitEditingMode(true);
+    } catch (e) { /* older API */ }
+  }
   if (out !== content) {
     await logseq.Editor.updateBlock(block.uuid, out);
     if (!out.trim()) {
@@ -360,7 +390,7 @@ async function expandBlock(block) {
         const props = Object.entries(again.properties || {}).filter(([k]) => k !== "id");
         if (props.length) await logseq.Editor.updateBlock(block.uuid, "");
         const fresh = await logseq.Editor.getBlock(block.uuid);
-        if (fresh && (fresh.content || "").trim()) {
+        if (fresh && (fresh.content || "").trim() && !(await hasChildren(block.uuid))) {
           const nb = await logseq.Editor.insertBlock(block.uuid, "", { sibling: true, before: true });
           await logseq.Editor.removeBlock(block.uuid);
           if (nb) block = nb;
@@ -374,7 +404,7 @@ async function expandBlock(block) {
     if (nb) after = nb.uuid;
   }
   for (const name of ctx.templates) await insertTemplateAfter(after, name);
-  if (ctx.noOutput && !out.trim()) { await logseq.Editor.removeBlock(block.uuid); return; }
+  if (ctx.noOutput && !out.trim() && !(await hasChildren(block.uuid))) { await logseq.Editor.removeBlock(block.uuid); return; }
   if (cursorPos >= 0) cursorTarget = { uuid: block.uuid, pos: cursorPos };
 }
 
@@ -397,9 +427,9 @@ async function liftMetadata(block) {
     toRemove.push(c);
   }
   if (!props.length) return;
+  let after = block.uuid; // one running position, so the children of several lifted blocks keep their order
   for (const c of toRemove) {
     const kids = ((await logseq.Editor.getBlock(c.uuid, { includeChildren: true })) || {}).children || [];
-    let after = block.uuid;
     for (const k of kids) {
       const ku = k.uuid || k[1];
       await logseq.Editor.moveBlock(ku, after, { sibling: true, before: false });
@@ -417,15 +447,24 @@ async function liftMetadata(block) {
 }
 
 async function process() {
-  const items = queue; queue = [];
-  for (const b of items) { try { await expandBlock(b); } catch (e) { console.error("[template-commands] expand failed", e); } }
-  for (const b of items) { try { await liftMetadata(b); } catch (e) { console.error("[template-commands] lift failed", e); } }
-  if (cursorTarget) {
-    const t = cursorTarget; cursorTarget = null;
-    await new Promise((r) => setTimeout(r, 150));
-    try { await logseq.Editor.editBlock(t.uuid, { pos: t.pos }); } catch (e) { /* gone */ }
-  }
-  setTimeout(() => recent.clear(), 5000);
+  // One run at a time. Each block is read again when its turn comes: the snapshot from the change event
+  // can be older than what was typed since, and writing from it lost that text; and a block whose
+  // tokens an earlier pass already expanded (our own id:: write queues it again) is now skipped.
+  if (running) { clearTimeout(timer); timer = setTimeout(process, 400); return; }
+  running = true;
+  try {
+    const uuids = [...queue.keys()]; queue = new Map();
+    const fresh = async (uuid) => { try { return await logseq.Editor.getBlock(uuid); } catch (e) { return null; } };
+    for (const u of uuids) { try { const b = await fresh(u); if (b) await expandBlock(b); } catch (e) { console.error("[template-commands] expand failed", e); } }
+    for (const u of uuids) { try { const b = await fresh(u); if (b) await liftMetadata(b); } catch (e) { console.error("[template-commands] lift failed", e); } }
+    if (cursorTarget) {
+      const t = cursorTarget; cursorTarget = null;
+      await new Promise((r) => setTimeout(r, 150));
+      try { await logseq.Editor.editBlock(t.uuid, { pos: t.pos }); } catch (e) { /* gone */ }
+    }
+    const cutoff = Date.now() - 60000;
+    for (const [u, at] of recent) if (at < cutoff) recent.delete(u);
+  } finally { running = false; }
 }
 
 // ---------------------------------------------------------------- main
@@ -471,11 +510,11 @@ function main() {
   logseq.DB.onChanged(({ blocks }) => {
     for (const b of blocks || []) {
       if (!b || !b.uuid) continue;
-      recent.add(b.uuid);
+      recent.set(b.uuid, Date.now());
       const c = b.content || "";
-      if (((c.includes("{%") || c.includes("<%")) && !/^\s*template::/m.test(c)) || c.trim().toLowerCase() === "metadata") queue.push(b);
+      if (((c.includes("{%") || c.includes("<%")) && !/^\s*template::/m.test(c)) || c.trim().toLowerCase() === "metadata") queue.set(b.uuid, true);
     }
-    if (queue.length) { clearTimeout(timer); timer = setTimeout(process, 400); }
+    if (queue.size) { clearTimeout(timer); timer = setTimeout(process, 400); }
   });
   setTimeout(registerTemplateSlashCommands, 4000);
   logseq.App.onCurrentGraphChanged(() => setTimeout(registerTemplateSlashCommands, 4000));
