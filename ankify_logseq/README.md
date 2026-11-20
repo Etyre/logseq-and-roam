@@ -41,7 +41,7 @@ ankify_logseq init-models                               # create note types if m
 
 ```
 cd ankify_logseq
-/usr/bin/python3 -m unittest discover tests/unit          # 39 unit tests, no Anki needed
+/usr/bin/python3 -m unittest discover tests/unit          # 55 unit tests, no Anki needed
 /usr/bin/python3 -m unittest tests.integration.test_anki   # end to end, in the Anki profile "ankify_test"
 /usr/bin/python3 -m ankify_logseq.cli check "/path/to/graph"
 ```

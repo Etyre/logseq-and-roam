@@ -156,6 +156,14 @@ class Page:
         return "<%s(title='%s')>" % (self.__class__.__name__, self.title)
 
 
+# Logseq task markers and the Roam checkbox state they stand for (DESIGN 2.1.4): every open
+# marker renders as an unchecked box with the TODO tag, a finished or cancelled one as checked/DONE.
+TASK_MARKERS = {
+    "TODO": "TODO", "LATER": "TODO", "NOW": "TODO", "DOING": "TODO", "WAITING": "TODO", "WAIT": "TODO",
+    "IN-PROGRESS": "TODO", "DONE": "DONE", "CANCELED": "DONE", "CANCELLED": "DONE",
+}
+
+
 class Block:
     def __init__(self, content=None, children=None, uid=None, parent=None,
                  marker=None, properties=None, path=None, line_start=None,
@@ -218,8 +226,8 @@ class Block:
     def get_tags(self, inherit=True, drop_duplicates=False, from_attr=False):
         """Tags on the block, own tags first, then parents' (see ankify_roam)."""
         tags = self.content.get_tags()
-        if self.marker in ("TODO", "DONE"):
-            tags = tags + [self.marker]
+        if self.marker in TASK_MARKERS:
+            tags = tags + [TASK_MARKERS[self.marker]]
         if inherit:
             if isinstance(self.parent, Page):
                 tags += self.parent.get_tags(from_attr=from_attr)
@@ -243,8 +251,8 @@ class Block:
         if children:
             return self._listify_back([self], **kwargs)
         html = self.content.to_html(*args, **kwargs)
-        if self.marker in ("TODO", "DONE"):
-            html = Checkbox(checked=(self.marker == "DONE")).to_html() + " " + html
+        if self.marker in TASK_MARKERS:
+            html = Checkbox(checked=(TASK_MARKERS[self.marker] == "DONE")).to_html() + " " + html
         return html
 
     def _listify_back(self, blocks, **kwargs):

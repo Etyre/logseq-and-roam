@@ -168,6 +168,9 @@ class LogseqGraphAnkifier:
                 logger.error(str(e))
                 done = []
             report.persisted = list(persister.written)
+            if self.dry_run and persister.resolve_mode() != "never":
+                # nothing is written in a dry run, so say what would be
+                report.persisted = [(b.path, b.line_start, None) for b in need]
             if done:
                 blocks = self.blocks_to_ankify(graph)
 
@@ -265,7 +268,12 @@ class LogseqGraphAnkifier:
         uid = note["fields"][self.uid_field]
         if self._notes_by_uid is not None:
             hit = self._notes_by_uid.get(uid)
-            return hit if hit else (None, None)
+            if hit:
+                return hit
+            # The prefetch only covers the two default note types. A block with a `note=` option naming
+            # another type must be looked up directly, or it is added again on every run.
+            if note.get("modelName") in (self.note_basic, self.note_cloze):
+                return None, None
         note_id = anki.get_note_id(note, self.uid_field)
         if not note_id:
             return None, None
@@ -475,9 +483,10 @@ class BlockAnkifier:
     def _get_include_page(self, block):
         opt = self._get_option(block, "include-page")
         if opt:
-            if opt == 'True':
+            # properties are written lowercase (`include-page:: true`); tag options say True/False
+            if str(opt).lower() == 'true':
                 return True
-            if opt == 'False':
+            if str(opt).lower() == 'false':
                 return False
         return self.include_page
 

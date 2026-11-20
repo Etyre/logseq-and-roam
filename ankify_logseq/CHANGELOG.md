@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-11-20: fixes from a code review
+
+- File-mode id persistence put the `id::` line inside a code fence when the block's first line opened one;
+  the block never got an id and every run added another line. The id now goes after the closing fence.
+- The parser counted lines with `str.splitlines()` (which also breaks on form feeds and U+2028/2029) while
+  the persister split on newlines, so an id could land on the wrong block. Both split on `\n` now.
+- `- item` lines inside a fenced code block are no longer split off as child blocks (only when the fence is
+  closed further down, so a stray fence cannot swallow a page).
+- A continuation line such as `std::vector ...` (no space after `::`) is content, not a property.
+- API-mode id persistence matches blocks that carry a task marker, and is no longer off by one on pages
+  with a page-properties block.
+- A `note=` option naming a third note type no longer re-adds the note on every run (the prefetch covers
+  only the two default types; other types are looked up directly).
+- `include-page:: true` (lowercase, as properties are written) is honoured.
+- A dry run reports how many ids would be persisted.
+- LATER / NOW / DOING / WAITING / IN-PROGRESS render as an unchecked box with the TODO tag, CANCELED as
+  checked with DONE (DESIGN 2.1.4); before, they vanished from the card.
+
 ## Unreleased
 
 ### Purple flag for suspend=False (2026-09-12)

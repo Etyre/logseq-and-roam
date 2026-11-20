@@ -24,7 +24,10 @@ from ankify_logseq.logseq.api import LogseqApi, LogseqApiError, logseq_process_r
 
 logger = logging.getLogger(__name__)
 
-RE_PROPERTY_LINE = re.compile(r"^\s*[A-Za-z0-9_.\-]+:: ?.*$")
+RE_PROPERTY_LINE = re.compile(r"^\s*[A-Za-z0-9_.\-]+::(?: .*)?\s*$")
+# what the parser removes from a block's text but Logseq's own `content` still carries
+RE_TASK_PREFIX = re.compile(r"^\s*(?:TODO|DOING|DONE|LATER|NOW|WAITING|WAIT|CANCELED|CANCELLED|IN-PROGRESS)(?: \[#[A-C]\])?(?: |$)")
+RE_TASK_LINE = re.compile(r"^\s*(?:(?:SCHEDULED|DEADLINE):\s*<.*>|:LOGBOOK:|:END:|CLOCK: .*)\s*$")
 
 
 class PersistError(Exception):
@@ -32,7 +35,9 @@ class PersistError(Exception):
 
 
 def _norm(text):
-    text = "\n".join(l for l in text.splitlines() if not RE_PROPERTY_LINE.match(l))
+    lines = text.split("\n")
+    text = "\n".join(l for i, l in enumerate(lines) if i == 0 or not (RE_PROPERTY_LINE.match(l) or RE_TASK_LINE.match(l)))
+    text = RE_TASK_PREFIX.sub("", text, count=1)
     return re.sub(r"[\s ]+", " ", text).strip()
 
 
@@ -100,9 +105,10 @@ class IdPersister:
             # insert from the bottom so earlier line numbers stay valid
             for b in sorted(page_blocks, key=lambda x: -x.line_start):
                 new_uuid = str(uuidlib.uuid4())
-                lines.insert(b.line_start, f"{_property_indent(lines[b.line_start - 1], b.depth)}id:: {new_uuid}")
-                self.written.append((path, b.line_start + 1, new_uuid))
-                logger.info(f"persisted id {new_uuid} at {path}:{b.line_start + 1} (file)")
+                at = _id_line_index(lines, b)
+                lines.insert(at, f"{_property_indent(lines[b.line_start - 1], b.depth)}id:: {new_uuid}")
+                self.written.append((path, at + 1, new_uuid))
+                logger.info(f"persisted id {new_uuid} at {path}:{at + 1} (file)")
                 done.append(b)
             _atomic_write(path, "\n".join(lines))
             self.graph.reload_page(path)
@@ -163,6 +169,11 @@ class IdPersister:
 def _index_tree(tree):
     """Flatten Logseq's page tree into [(path_tuple, normalized_content, uuid)]."""
     out = []
+    # Logseq lists the page-properties block as the first block; the parser does not keep it, so
+    # leaving it in shifted every top-level position by one.
+    tree = list(tree or [])
+    if tree and (tree[0].get("preBlock?") or _only_properties(tree[0].get("content") or "")):
+        tree = tree[1:]
     def walk(bs, prefix):
         for i, b in enumerate(bs or []):
             p = prefix + (i,)
@@ -170,6 +181,14 @@ def _index_tree(tree):
             walk(b.get("children"), p)
     walk(tree, ())
     return out
+
+
+def _only_properties(content):
+    """A first block made of nothing but `key:: value` lines, at least one of them not bookkeeping:
+    the page-properties block (same rule as parser.build_page)."""
+    lines = [l for l in content.split("\n") if l.strip()]
+    keys = [l.strip().split("::", 1)[0] for l in lines if RE_PROPERTY_LINE.match(l)]
+    return bool(lines) and len(keys) == len(lines) and any(k not in ("id", "collapsed") for k in keys)
 
 
 def _tree_path(block):
@@ -194,6 +213,21 @@ def _find_uuid(block, index):
     if len(same) == 1:
         return same[0]
     return None
+
+
+def _id_line_index(lines, block):
+    """Where (0-based index into the file's lines) the id line of a block goes: straight after its
+    first line, unless that line opens a code fence. An id inside the fence is code, not a property:
+    the block stayed without an id and every run added another line. Then it goes after the closing fence."""
+    first = block.line_start - 1
+    last = (block.line_end or block.line_start) - 1
+    if lines[first].count("```") % 2 == 1:
+        fences = lines[first].count("```")
+        for i in range(first + 1, min(last, len(lines) - 1) + 1):
+            fences += lines[i].count("```")
+            if fences % 2 == 0:
+                return i + 1
+    return first + 1
 
 
 def _property_indent(bullet_line, depth):

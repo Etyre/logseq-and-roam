@@ -26,7 +26,10 @@ from ankify_logseq.logseq.content import BlockContent
 logger = logging.getLogger(__name__)
 
 RE_BULLET = re.compile(r"^(?P<indent>[ \t]*)-(?: (?P<text>.*)|)$")
-RE_PROPERTY = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.\-]+):: ?(?P<value>.*?)\s*$")
+# `key:: value` or a bare `key::`. Text straight after the colons (`std::vector`, `Deck::Sub`) is not a
+# property: such a continuation line used to be taken out of the card.
+RE_PROPERTY = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.\-]+)::(?: (?P<value>.*?))?\s*$")
+RE_FENCE = re.compile(r"^\s*(?:- )?```")
 RE_MARKER = re.compile(
     r"^(?P<marker>TODO|DOING|DONE|LATER|NOW|WAITING|WAIT|CANCELED|CANCELLED|IN-PROGRESS)"
     r"(?: \[#(?P<priority>[A-C])\])?(?: |$)")
@@ -189,9 +192,18 @@ def split_blocks(lines, first_line_no=1):
     properties)."""
     raw_blocks = []
     current = None
+    fence_until = -1  # index of the line closing the code fence we are inside, if any
     for offset, line in enumerate(lines):
         line = line.rstrip("\n")
         m = RE_BULLET.match(line)
+        if offset <= fence_until and current is not None:
+            m = None  # a "- item" line inside a fenced code block is code, not a new block
+        elif RE_FENCE.match(line):
+            # A fence opens here. Only trust it when it is closed further down, so that one stray
+            # fence cannot swallow the rest of the page into a single block.
+            close = next((j for j in range(offset + 1, len(lines)) if lines[j].strip().startswith("```")), None)
+            if close is not None:
+                fence_until = close
         if m:
             depth = _indent_depth(m.group("indent"))
             current = _RawBlock(depth, m.group("text") or "", first_line_no + offset)
@@ -250,7 +262,7 @@ def _separate_properties(lines, depth, is_first_block=False, importer_layout=Fal
             continue
         pm = RE_PROPERTY.match(line)
         if pm and not _inside_code(content_lines):
-            properties[pm.group("key")] = pm.group("value")
+            properties[pm.group("key")] = pm.group("value") or ""
             continue
         content_lines.append(line)
 
@@ -262,7 +274,7 @@ def _separate_properties(lines, depth, is_first_block=False, importer_layout=Fal
             m2 = RE_PROPERTY.match(l)
             if not m2:
                 continue
-            first_props[m2.group("key")] = m2.group("value")
+            first_props[m2.group("key")] = m2.group("value") or ""
             if not is_first_block and m2.group("key") not in HIDDEN_PROPERTIES:
                 kept.append(l)  # stays content, as in ankify_roam
         # keep line order: the first line's properties come before those already collected
@@ -289,7 +301,11 @@ def _inside_code(content_lines):
 
 def build_page(path, text, config, title=None, is_journal=False, graph=None):
     """Parse one markdown file into a Page."""
-    lines = text.splitlines()
+    # Split on "\n" only, exactly as persist.py does when it inserts an id line: str.splitlines() also
+    # breaks on form feeds and U+2028/2029, which shifted every later line number and put ids on the wrong block.
+    lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
     front_matter, body, consumed = split_front_matter(lines)
     raw_blocks = split_blocks(body, first_line_no=consumed + 1)
     importer_layout = is_importer_layout(body)
